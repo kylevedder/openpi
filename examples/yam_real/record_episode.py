@@ -11,6 +11,12 @@ import tyro
 
 from examples.yam_real import common
 
+SYNC_BUTTON_INDEX = 0
+RECORD_BUTTON_INDEX = 1
+STATUS_CUE_START_PATTERN = (0.12,)
+STATUS_CUE_STOP_PATTERN = (0.06, 0.06)
+STATUS_CUE_GAP_S = 0.06
+
 
 @dataclasses.dataclass
 class Args:
@@ -23,6 +29,8 @@ class Args:
     bilateral_kp: float = 0.2
     ee_mass: float | None = None
     use_gravity_comp: bool = False
+    status_haptic_cue: bool = True
+    status_cue_gain: float = 0.08
     record_only_when_synced: bool = True
     startup_check_only: bool = False
 
@@ -32,6 +40,7 @@ class YamLeader:
         self.robot = robot
         self._motor_chain = robot.motor_chain
         self._nominal_kp = np.asarray(robot.get_robot_info()["kp"], dtype=np.float32).copy()
+        self._nominal_kd = np.asarray(robot.get_robot_info()["kd"], dtype=np.float32).copy()
 
     def get_info(self) -> tuple[np.ndarray, np.ndarray]:
         qpos = np.asarray(self.robot.get_observations()["joint_pos"], dtype=np.float32)
@@ -49,6 +58,23 @@ class YamLeader:
             self.robot.update_kp_kd(kp=self._nominal_kp * gain, kd=np.zeros(6))
         else:
             self.robot.update_kp_kd(kp=np.zeros(6), kd=np.zeros(6))
+        self.command_arm_pos(self.current_arm_pos())
+
+    def current_arm_pos(self) -> np.ndarray:
+        return np.asarray(self.robot.get_observations()["joint_pos"], dtype=np.float32)
+
+    def pulse_haptic(self, *, pattern_s: tuple[float, ...], gain: float) -> None:
+        qpos = self.current_arm_pos()
+        kp = self._nominal_kp * gain
+        kd = self._nominal_kd * gain
+        zero_k = np.zeros_like(kp)
+        for duration_s in pattern_s:
+            self.robot.update_kp_kd(kp=kp, kd=kd)
+            self.command_arm_pos(qpos)
+            time.sleep(duration_s)
+            self.robot.update_kp_kd(kp=zero_k, kd=zero_k)
+            self.command_arm_pos(qpos)
+            time.sleep(STATUS_CUE_GAP_S)
 
 
 class TeleopPair:
@@ -61,10 +87,10 @@ class TeleopPair:
         self._last_button = 0.0
         self._last_command = common.get_follower_state(follower)
 
-    def step(self) -> tuple[np.ndarray, np.ndarray]:
+    def step(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         leader_i2rt, buttons = self.leader.get_info()
         follower_openpi = common.get_follower_state(self.follower)
-        button = float(buttons[0]) if buttons.size else 0.0
+        button = float(buttons[SYNC_BUTTON_INDEX]) if buttons.size > SYNC_BUTTON_INDEX else 0.0
 
         if button > 0.5 and self._last_button <= 0.5:
             self._toggle_sync(leader_i2rt, follower_openpi)
@@ -77,10 +103,15 @@ class TeleopPair:
         else:
             self._last_command = follower_openpi
 
-        return follower_openpi, self._last_command
+        return follower_openpi, self._last_command, buttons
 
     def close(self) -> None:
         self.leader.set_bilateral(enabled=False, gain=self.bilateral_kp)
+
+    def emit_recording_status(self, *, recording: bool, gain: float) -> None:
+        pattern = STATUS_CUE_START_PATTERN if recording else STATUS_CUE_STOP_PATTERN
+        self.leader.pulse_haptic(pattern_s=pattern, gain=gain)
+        self.leader.set_bilateral(enabled=self.synchronized, gain=self.bilateral_kp)
 
     def _toggle_sync(self, leader_i2rt: np.ndarray, follower_openpi: np.ndarray) -> None:
         self.synchronized = not self.synchronized
@@ -110,7 +141,9 @@ def main(args: Args) -> None:
     gripper_type = GripperType.from_string_name(args.gripper)
     episode_dir = common.make_episode_dir(args.output_dir, args.episode_name)
     print(f"Recording directory: {episode_dir}")
-    print("Controls: press 'r' to start/stop recording, 'q' to stop. Leader top buttons toggle sync per side.")
+    print("Controls: leader top buttons toggle sync per side; leader bottom button or 'r' starts/stops and saves.")
+    print("'q' stops and saves without toggling recording.")
+    print("Recording haptic cue: one leader pulse=start, two leader pulses=stop.")
 
     robots = []
     states: list[np.ndarray] = []
@@ -121,6 +154,51 @@ def main(args: Args) -> None:
     start_time = None
     frame_idx = 0
     next_record_t = time.monotonic()
+    last_record_button = 0.0
+    episode_saved = False
+
+    def save_episode() -> None:
+        nonlocal episode_saved
+        if episode_saved:
+            return
+        if not states:
+            raise RuntimeError("No frames recorded. Enable sync and toggle recording before stopping.")
+
+        np.savez_compressed(
+            episode_dir / "episode.npz",
+            state=np.asarray(states, dtype=np.float32),
+            action=np.asarray(actions, dtype=np.float32),
+            timestamp=np.asarray(timestamps, dtype=np.float64),
+            image_paths=np.asarray(image_paths, dtype=object),
+        )
+        manifest = common.EpisodeManifest(
+            task=args.task,
+            fps=args.fps,
+            created_at=time.time(),
+            state_order=common.STATE_ORDER,
+            action_space=common.ACTION_SPACE,
+            gripper_convention=common.GRIPPER_CONVENTION,
+            camera_paths=common.CAMERA_PATHS,
+            leader_channels=common.LEADER_CHANNELS,
+            follower_channels=common.FOLLOWER_CHANNELS,
+            num_frames=len(states),
+        )
+        manifest.write(episode_dir / "manifest.json")
+        episode_saved = True
+        print(f"Recorded {len(states)} frames to {episode_dir}")
+
+    def toggle_recording() -> bool:
+        nonlocal recording, start_time, next_record_t
+        was_recording = recording
+        recording = not recording
+        print(f"recording={recording}")
+        if recording and start_time is None:
+            start_time = time.monotonic()
+        next_record_t = time.monotonic()
+        if args.status_haptic_cue:
+            pair_l.emit_recording_status(recording=recording, gain=args.status_cue_gain)
+            pair_r.emit_recording_status(recording=recording, gain=args.status_cue_gain)
+        return was_recording and not recording
 
     try:
         follower_l = get_yam_robot(
@@ -180,16 +258,21 @@ def main(args: Args) -> None:
             while True:
                 key = common.read_key_nonblocking()
                 if key == "q":
+                    if recording:
+                        toggle_recording()
                     break
-                if key == "r":
-                    recording = not recording
-                    print(f"recording={recording}")
-                    if recording and start_time is None:
-                        start_time = time.monotonic()
-                    next_record_t = time.monotonic()
+                if key == "r" and toggle_recording():
+                    break
 
-                state_l, action_l = pair_l.step()
-                state_r, action_r = pair_r.step()
+                state_l, action_l, buttons_l = pair_l.step()
+                state_r, action_r, buttons_r = pair_r.step()
+                record_button = max(
+                    float(buttons_l[RECORD_BUTTON_INDEX]) if buttons_l.size > RECORD_BUTTON_INDEX else 0.0,
+                    float(buttons_r[RECORD_BUTTON_INDEX]) if buttons_r.size > RECORD_BUTTON_INDEX else 0.0,
+                )
+                if record_button > 0.5 and last_record_button <= 0.5 and toggle_recording():
+                    break
+                last_record_button = record_button
                 now = time.monotonic()
                 should_record = recording and now >= next_record_t
                 if args.record_only_when_synced and not (pair_l.synchronized and pair_r.synchronized):
@@ -209,38 +292,19 @@ def main(args: Args) -> None:
                     and start_time is not None
                     and time.monotonic() - start_time >= args.max_duration_s
                 ):
+                    if recording:
+                        toggle_recording()
                     break
 
                 time.sleep(0.005)
+    except KeyboardInterrupt:
+        print("Interrupted; saving recorded frames before exit.")
     finally:
         for robot in robots:
             with contextlib.suppress(Exception):
                 robot.close()
 
-    if not states:
-        raise RuntimeError("No frames recorded. Enable sync and press 'r' before stopping.")
-
-    np.savez_compressed(
-        episode_dir / "episode.npz",
-        state=np.asarray(states, dtype=np.float32),
-        action=np.asarray(actions, dtype=np.float32),
-        timestamp=np.asarray(timestamps, dtype=np.float64),
-        image_paths=np.asarray(image_paths, dtype=object),
-    )
-    manifest = common.EpisodeManifest(
-        task=args.task,
-        fps=args.fps,
-        created_at=time.time(),
-        state_order=common.STATE_ORDER,
-        action_space=common.ACTION_SPACE,
-        gripper_convention=common.GRIPPER_CONVENTION,
-        camera_paths=common.CAMERA_PATHS,
-        leader_channels=common.LEADER_CHANNELS,
-        follower_channels=common.FOLLOWER_CHANNELS,
-        num_frames=len(states),
-    )
-    manifest.write(episode_dir / "manifest.json")
-    print(f"Recorded {len(states)} frames to {episode_dir}")
+    save_episode()
 
 
 if __name__ == "__main__":

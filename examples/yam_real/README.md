@@ -57,8 +57,12 @@ uv run python -m examples.yam_real.record_episode \
 Controls:
 
 - Press the top button on each leader handle to enable sync for that side.
-- Press `r` in the terminal to start or stop recording.
-- Press `q` to stop and save.
+- Press the bottom button on either leader handle, or `r` in the terminal, to start recording.
+- Press the bottom button or `r` again to stop recording, save the full episode, and exit.
+- Press `q` to save and exit without toggling recording.
+
+Recording status is also echoed on the leader arms as a haptic cue: one short pulse means recording started; two short
+pulses means recording stopped. Disable this with `--no-status-haptic-cue` if it is distracting.
 
 The recorder writes:
 
