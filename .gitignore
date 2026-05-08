@@ -2,6 +2,7 @@
 assets/
 checkpoints/
 data/
+yam_data/
 wandb/
 
 # Byte-compiled / optimized / DLL files
