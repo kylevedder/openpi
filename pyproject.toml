@@ -38,6 +38,8 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "python-can==4.5.0",
+    "mujoco==3.3.5",
 ]
 
 
