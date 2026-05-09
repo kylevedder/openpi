@@ -68,12 +68,14 @@ The recorder writes:
 
 ```text
 yam_data/raw/<episode_name>/
-  manifest.json
-  episode.npz
-  images/cam_high/*.jpg
-  images/cam_left_wrist/*.jpg
-  images/cam_right_wrist/*.jpg
+  episode_part0.mcap
+  episode_part1.mcap
+  episode_part2.mcap
+  episode_part3.mcap
 ```
+
+The MCAP files use the standalone PiStream/ARX-compatible raw-log format. `episode_part0.mcap` contains light
+state/action/system fields, and each camera stream is stored in its own H264 shard.
 
 ## 2. Replay the Recorded Actions
 

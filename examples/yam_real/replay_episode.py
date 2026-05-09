@@ -10,6 +10,7 @@ import numpy as np
 import tyro
 
 from examples.yam_real import common
+from examples.yam_real import mcap_episode
 
 
 @dataclasses.dataclass
@@ -26,15 +27,14 @@ class Args:
 
 
 def main(args: Args) -> None:
-    manifest, arrays = common.load_episode(args.episode_dir)
-    actions = np.asarray(arrays["action"], dtype=np.float32)
+    task, fps, actions = _load_actions(args.episode_dir)
     if args.max_steps is not None:
         actions = actions[: args.max_steps]
-    fps = args.fps or float(manifest["fps"])
+    fps = args.fps or fps
 
     print(f"Episode: {args.episode_dir}")
     print(f"Frames: {len(actions)}, fps={fps}, execute={args.execute}")
-    print(f"Task: {manifest.get('task', '')}")
+    print(f"Task: {task}")
     if not args.execute:
         print("Dry run only. Re-run with --execute to command the followers.")
         print(f"First action: {actions[0].round(4).tolist()}")
@@ -88,6 +88,13 @@ def main(args: Args) -> None:
         for robot in robots:
             with contextlib.suppress(Exception):
                 robot.close()
+
+
+def _load_actions(episode_dir: Path) -> tuple[str, float, np.ndarray]:
+    if not mcap_episode.is_mcap_episode(episode_dir):
+        raise FileNotFoundError(f"No MCAP episode found at {episode_dir}")
+    episode = mcap_episode.read_episode(episode_dir, decode_images=False)
+    return episode.task, episode.fps, episode.action
 
 
 if __name__ == "__main__":

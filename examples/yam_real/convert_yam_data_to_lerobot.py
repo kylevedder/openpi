@@ -5,14 +5,13 @@ from pathlib import Path
 import shutil
 from typing import Literal
 
-import cv2
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
 import tqdm
 import tyro
 
-from examples.yam_real import common
+from examples.yam_real import mcap_episode
 
 
 @dataclasses.dataclass
@@ -31,12 +30,11 @@ def main(args: Args) -> None:
             raise FileExistsError(output_path)
         shutil.rmtree(output_path)
 
-    episode_dirs = sorted(path for path in args.raw_dir.iterdir() if (path / "manifest.json").exists())
+    episode_dirs = mcap_episode.iter_episode_dirs(args.raw_dir)
     if not episode_dirs:
         raise FileNotFoundError(f"No recorded YAM episodes found under {args.raw_dir}")
 
-    first_manifest, _ = common.load_episode(episode_dirs[0])
-    fps = round(float(first_manifest["fps"]))
+    fps = round(_episode_fps(episode_dirs[0]))
 
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
@@ -63,26 +61,7 @@ def main(args: Args) -> None:
     )
 
     for episode_dir in tqdm.tqdm(episode_dirs, desc="Converting YAM episodes"):
-        manifest, arrays = common.load_episode(episode_dir)
-        states = np.asarray(arrays["state"], dtype=np.float32)
-        actions = np.asarray(arrays["action"], dtype=np.float32)
-        image_paths = arrays["image_paths"]
-        if states.shape != actions.shape or states.shape[-1] != 14:
-            raise RuntimeError(f"Bad state/action shapes in {episode_dir}: {states.shape}, {actions.shape}")
-        if len(image_paths) != len(states):
-            raise RuntimeError(f"Image path count mismatch in {episode_dir}: {len(image_paths)} vs {len(states)}")
-
-        for idx in range(len(states)):
-            frame = {
-                "observation.state": states[idx],
-                "action": actions[idx],
-                "task": manifest["task"],
-            }
-            paths = image_paths[idx].item() if hasattr(image_paths[idx], "item") else image_paths[idx]
-            frame["observation.images.cam_high"] = _load_chw_rgb(episode_dir / paths["cam_high"])
-            frame["observation.images.cam_left_wrist"] = _load_chw_rgb(episode_dir / paths["cam_left_wrist"])
-            frame["observation.images.cam_right_wrist"] = _load_chw_rgb(episode_dir / paths["cam_right_wrist"])
-            dataset.add_frame(frame)
+        _add_mcap_episode(dataset, episode_dir)
         dataset.save_episode()
 
     if hasattr(dataset, "consolidate"):
@@ -100,12 +79,35 @@ def _image_feature(mode: str) -> dict:
     }
 
 
-def _load_chw_rgb(path: Path) -> np.ndarray:
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise FileNotFoundError(path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return np.transpose(image, (2, 0, 1))
+def _episode_fps(episode_dir: Path) -> float:
+    return mcap_episode.read_episode(episode_dir, decode_images=False).fps
+
+
+def _add_mcap_episode(dataset: LeRobotDataset, episode_dir: Path) -> None:
+    episode = mcap_episode.read_episode(episode_dir, decode_images=True)
+    if episode.images is None:
+        raise RuntimeError(f"MCAP episode did not decode images: {episode_dir}")
+    _validate_state_action(episode_dir, episode.state, episode.action)
+    for idx in range(len(episode.state)):
+        dataset.add_frame(
+            {
+                "observation.state": episode.state[idx],
+                "action": episode.action[idx],
+                "task": episode.task,
+                "observation.images.cam_high": _to_chw(episode.images["cam_high"][idx]),
+                "observation.images.cam_left_wrist": _to_chw(episode.images["cam_left_wrist"][idx]),
+                "observation.images.cam_right_wrist": _to_chw(episode.images["cam_right_wrist"][idx]),
+            }
+        )
+
+
+def _validate_state_action(episode_dir: Path, states: np.ndarray, actions: np.ndarray) -> None:
+    if states.shape != actions.shape or states.shape[-1] != 14:
+        raise RuntimeError(f"Bad state/action shapes in {episode_dir}: {states.shape}, {actions.shape}")
+
+
+def _to_chw(image_rgb: np.ndarray) -> np.ndarray:
+    return np.transpose(image_rgb, (2, 0, 1))
 
 
 if __name__ == "__main__":

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import contextlib
-import dataclasses
-import json
 import os
 from pathlib import Path
 import sys
@@ -54,23 +52,6 @@ def ensure_i2rt_importable() -> None:
             return
 
 
-@dataclasses.dataclass(frozen=True)
-class EpisodeManifest:
-    task: str
-    fps: float
-    created_at: float
-    state_order: tuple[str, ...]
-    action_space: str
-    gripper_convention: str
-    camera_paths: dict[str, str]
-    leader_channels: dict[str, str]
-    follower_channels: dict[str, str]
-    num_frames: int
-
-    def write(self, path: Path) -> None:
-        path.write_text(json.dumps(dataclasses.asdict(self), indent=2))
-
-
 class CameraSet:
     def __init__(self, paths: dict[str, str] | None = None, width: int = 640, height: int = 480) -> None:
         self.paths = paths or CAMERA_PATHS
@@ -110,20 +91,7 @@ def make_episode_dir(root: Path, name: str | None = None) -> Path:
     episode_name = name or time.strftime("episode_%Y%m%d_%H%M%S")
     episode_dir = root / episode_name
     episode_dir.mkdir(parents=True, exist_ok=False)
-    for camera_name in CAMERA_NAMES:
-        (episode_dir / "images" / camera_name).mkdir(parents=True, exist_ok=True)
     return episode_dir
-
-
-def save_frames(episode_dir: Path, frame_index: int, frames: dict[str, np.ndarray]) -> dict[str, str]:
-    rel_paths = {}
-    for camera_name, frame in frames.items():
-        rel_path = Path("images") / camera_name / f"{frame_index:06d}.jpg"
-        out_path = episode_dir / rel_path
-        if not cv2.imwrite(str(out_path), frame):
-            raise RuntimeError(f"Failed to write image {out_path}")
-        rel_paths[camera_name] = str(rel_path)
-    return rel_paths
 
 
 def get_follower_state(robot) -> np.ndarray:
@@ -163,19 +131,6 @@ def clip_bimanual_delta(
     max_delta = np.full((14,), max_arm_step_rad, dtype=np.float32)
     max_delta[[6, 13]] = max_gripper_step
     return previous + np.clip(target - previous, -max_delta, max_delta)
-
-
-def load_episode(episode_dir: Path) -> tuple[dict, dict[str, np.ndarray]]:
-    manifest_path = episode_dir / "manifest.json"
-    arrays_path = episode_dir / "episode.npz"
-    if not manifest_path.exists():
-        raise FileNotFoundError(manifest_path)
-    if not arrays_path.exists():
-        raise FileNotFoundError(arrays_path)
-    manifest = json.loads(manifest_path.read_text())
-    with np.load(arrays_path, allow_pickle=True) as data:
-        arrays = {key: data[key] for key in data.files}
-    return manifest, arrays
 
 
 @contextlib.contextmanager

@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package monopi.pi_stream;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+message PiFrame {
+  PiFrameHeader header = 1;
+  repeated PiField fields = 2;
+}
+
+message PiFrameHeader {
+  string publisher_id = 1;
+  int64 sequence_id = 2;
+  google.protobuf.Timestamp capture_timestamp = 3;
+}
+
+message PiField {
+  string key = 1;
+  PiFieldValue value = 3;
+}
+
+message PiFieldList {
+  repeated PiField fields = 1;
+}
+
+message PiFieldValue {
+  oneof value {
+    bool bool_value = 1;
+    float float_value = 2;
+    double double_value = 3;
+    string string_value = 4;
+    bytes bytes_value = 5;
+    int32 int32_value = 6;
+    int64 int64_value = 7;
+    uint32 uint32_value = 8;
+    uint64 uint64_value = 9;
+    sint32 sint32_value = 10;
+    sint64 sint64_value = 11;
+    fixed32 fixed32_value = 12;
+    fixed64 fixed64_value = 13;
+    sfixed32 sfixed32_value = 14;
+    sfixed64 sfixed64_value = 15;
+    BoolList bool_list = 16;
+    FloatList float_list = 17;
+    DoubleList double_list = 18;
+    StringList string_list = 19;
+    BytesList bytes_list = 20;
+    Int32List int32_list = 21;
+    Int64List int64_list = 22;
+    Uint32List uint32_list = 23;
+    Uint64List uint64_list = 24;
+    Sint32List sint32_list = 25;
+    Sint64List sint64_list = 26;
+    Fixed32List fixed32_list = 27;
+    Fixed64List fixed64_list = 28;
+    Sfixed32List sfixed32_list = 29;
+    Sfixed64List sfixed64_list = 30;
+    google.protobuf.Struct json_msg = 31;
+    google.protobuf.Any proto_msg = 32;
+    PiStreamSnapshotRef snapshot_ref = 33;
+    google.protobuf.Timestamp timestamp = 34;
+    google.protobuf.Duration duration = 35;
+    VideoFrame video_frame = 36;
+  }
+}
+
+message BoolList {
+  repeated bool values = 1;
+}
+message FloatList {
+  repeated float values = 1;
+}
+message DoubleList {
+  repeated double values = 1;
+}
+message StringList {
+  repeated string values = 1;
+}
+message BytesList {
+  repeated bytes values = 1;
+}
+message Int32List {
+  repeated int32 values = 1;
+}
+message Int64List {
+  repeated int64 values = 1;
+}
+message Uint32List {
+  repeated uint32 values = 1;
+}
+message Uint64List {
+  repeated uint64 values = 1;
+}
+message Sint32List {
+  repeated sint32 values = 1;
+}
+message Sint64List {
+  repeated sint64 values = 1;
+}
+message Fixed32List {
+  repeated fixed32 values = 1;
+}
+message Fixed64List {
+  repeated fixed64 values = 1;
+}
+message Sfixed32List {
+  repeated sfixed32 values = 1;
+}
+message Sfixed64List {
+  repeated sfixed64 values = 1;
+}
+
+message VideoFrame {
+  repeated bytes packets = 1;
+  int64 dts = 2;
+  int64 pts = 3;
+  uint32 iframe_offset = 4;
+  bytes extradata = 5;
+}
+
+message PiStreamSnapshotRef {
+  repeated PiFieldValueRef fields = 1;
+}
+
+message PiFieldValueRef {
+  string publisher_id = 1;
+  int64 sequence_id = 2;
+  google.protobuf.Timestamp capture_timestamp = 3;
+  string key = 4;
+  uint32 index = 6;
+}
