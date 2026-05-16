@@ -8,8 +8,8 @@ import modal
 APP_NAME = "yam-openpi"
 OPENPI_ROOT = "/root/openpi"
 VOLUME_ROOT = "/mnt/yam"
-CONFIG_NAME = "pi05_yam_bimanual_50hz"
-DEFAULT_EXP_NAME = "yam_bimanual_50hz_20demo_v1"
+CONFIG_NAME = "pi05_yam_bimanual_50hz_jpeg_q85"
+DEFAULT_EXP_NAME = "yam_bimanual_50hz_jpeg_q85_20demo_v1"
 SERVE_CHECKPOINT_STEP = 999
 
 app = modal.App(APP_NAME)

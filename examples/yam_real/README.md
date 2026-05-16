@@ -113,7 +113,27 @@ uv run python -m examples.yam_real.convert_yam_data_to_lerobot \
   --repo-id local/yam_bimanual
 ```
 
-The OpenPI config `pi05_yam_bimanual_50hz` expects this repo id by default.
+The OpenPI configs `pi05_yam_bimanual_50hz` and `pi05_yam_bimanual_50hz_jpeg_q85` expect this repo id by default.
+
+## Image Transport
+
+Pi0.5 consumes `224x224` images. The `pi05_yam_bimanual_50hz_jpeg_q85` config resizes training images to `224x224`
+and then applies the same OpenCV JPEG Q85 encode/decode round-trip used by inference. At runtime, `run_policy` sends
+those three resized camera frames as JPEG bytes and the policy server decodes them without applying a second JPEG pass.
+
+Benchmark the transport on the local recordings:
+
+```bash
+uv run python -m examples.yam_real.benchmark_jpeg_transport \
+  --raw-dir yam_data/raw \
+  --episode-manifest yam_data/manifests/pi05_yam_bimanual_50hz_20demo.txt \
+  --max-observations 80
+```
+
+On the initial 80-observation sample, raw msgpack was about `452 KB` per request. JPEG Q85 was about `28 KB`, roughly
+`16x` smaller, with about `0.34 ms` encode and `0.41 ms` decode overhead for all three cameras. Existing raw recordings
+are already stored as camera JPEGs; this transport adds the matched post-resize network JPEG artifact that the model sees
+during serving.
 
 ## 4. Modal GPU Training
 
@@ -123,10 +143,10 @@ Install and authenticate Modal locally, then run:
 uv pip install modal
 modal volume create yam-openpi
 modal volume put yam-openpi ~/.cache/huggingface/lerobot/local/yam_bimanual /lerobot/local/yam_bimanual -f
-modal run examples/yam_real/modal_app.py::compute_norm_stats --config-name pi05_yam_bimanual_50hz
+modal run examples/yam_real/modal_app.py::compute_norm_stats --config-name pi05_yam_bimanual_50hz_jpeg_q85
 modal run examples/yam_real/modal_app.py::train_fsdp2 \
-  --config-name pi05_yam_bimanual_50hz \
-  --exp-name yam_bimanual_50hz_20demo_v1 \
+  --config-name pi05_yam_bimanual_50hz_jpeg_q85 \
+  --exp-name yam_bimanual_50hz_jpeg_q85_20demo_v1 \
   --num-train-steps 1000 \
   --batch-size 8 \
   --overwrite
@@ -137,12 +157,13 @@ Use the short run first to validate the pipeline. For a real run over the full 2
 
 ```bash
 modal run --detach examples/yam_real/modal_app.py::train_fsdp2 \
-  --config-name pi05_yam_bimanual_50hz \
-  --exp-name yam_bimanual_50hz_20demo_v1 \
+  --config-name pi05_yam_bimanual_50hz_jpeg_q85 \
+  --exp-name yam_bimanual_50hz_jpeg_q85_20demo_v1 \
   --batch-size 8
 ```
 
-The Modal serving entrypoint is configured to serve checkpoint step `999` from `yam_bimanual_50hz_20demo_v1`.
+The Modal serving entrypoint is configured to serve checkpoint step `999` from
+`yam_bimanual_50hz_jpeg_q85_20demo_v1`.
 
 ```bash
 modal deploy examples/yam_real/modal_app.py
@@ -170,6 +191,9 @@ uv run python -m examples.yam_real.run_policy \
   --action-horizon 50 \
   --use-gravity-comp
 ```
+
+By default `run_policy` uses `--image-transport auto`, which follows the policy metadata. The JPEG-trained policy
+advertises `jpeg_q85_224_rgb_v1`, so the local robot host sends compressed `224x224` images automatically.
 
 Run a short bounded execute with an empty workspace only after dry-run returns sane 14D actions:
 

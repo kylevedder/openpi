@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import openpi.models.tokenizer as _tokenizer
+from openpi.shared import jpeg_transport
 import openpi.transforms as _transforms
 
 
@@ -119,3 +120,24 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_jpeg_round_trip_images_transform_applies_codec():
+    image = np.random.default_rng(0).integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
+
+    transformed = _transforms.JpegRoundTripImages()({"image": {"cam": image.copy()}})
+
+    np.testing.assert_array_equal(transformed["image"]["cam"], jpeg_transport.jpeg_roundtrip_rgb(image))
+
+
+def test_jpeg_round_trip_images_transform_skips_marked_transport_and_pops_marker():
+    image = np.random.default_rng(1).integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
+    data = {
+        "image": {"cam": image},
+        jpeg_transport.MARKER_KEY: jpeg_transport.IMAGE_TRANSPORT,
+    }
+
+    transformed = _transforms.JpegRoundTripImages()(data)
+
+    assert jpeg_transport.MARKER_KEY not in transformed
+    assert transformed["image"]["cam"] is image

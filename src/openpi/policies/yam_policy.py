@@ -1,10 +1,10 @@
 import dataclasses
 from typing import ClassVar
 
-import einops
 import numpy as np
 
 from openpi import transforms
+from openpi.shared import jpeg_transport
 
 ARM_JOINT_ORDER = (
     "waist",
@@ -43,7 +43,7 @@ class YamBimanualInputs(transforms.DataTransformFn):
     """Inputs for the bimanual YAM policy.
 
     Expected runtime input:
-    - images: dict[name, img] where img is either [C, H, W] or [H, W, C].
+    - images: dict[name, img] where img is either JPEG bytes, [C, H, W], or [H, W, C].
     - state: [14], ordered [left 6 joints, left gripper, right 6 joints, right gripper].
       Grippers use the PI/ARX convention: 0.0=open, 1.0=closed.
     - actions: [action_horizon, 14], same order as state, only present during training.
@@ -63,7 +63,19 @@ class YamBimanualInputs(transforms.DataTransformFn):
         if "cam_high" not in in_images:
             raise ValueError('YAM policy requires "cam_high" image input')
 
-        base_image = _parse_image(in_images["cam_high"])
+        decoded_images = {}
+        image_transports = []
+        for name, image in in_images.items():
+            decoded_image, image_transport = _parse_image(image)
+            decoded_images[name] = decoded_image
+            image_transports.append(image_transport)
+
+        if any(transport == jpeg_transport.IMAGE_TRANSPORT for transport in image_transports) and any(
+            transport is None for transport in image_transports
+        ):
+            raise ValueError("YAM images must not mix JPEG transport bytes with raw arrays")
+
+        base_image = decoded_images["cam_high"]
         images = {
             "base_0_rgb": base_image,
         }
@@ -76,7 +88,7 @@ class YamBimanualInputs(transforms.DataTransformFn):
             ("right_wrist_0_rgb", "cam_right_wrist"),
         ):
             if source in in_images:
-                images[dest] = _parse_image(in_images[source])
+                images[dest] = decoded_images[source]
                 image_masks[dest] = np.True_
             else:
                 images[dest] = np.zeros_like(base_image)
@@ -87,6 +99,8 @@ class YamBimanualInputs(transforms.DataTransformFn):
             "image_mask": image_masks,
             "state": state,
         }
+        if all(transport == jpeg_transport.IMAGE_TRANSPORT for transport in image_transports):
+            inputs[jpeg_transport.MARKER_KEY] = jpeg_transport.IMAGE_TRANSPORT
 
         if "actions" in data:
             actions = np.asarray(data["actions"], dtype=np.float32)
@@ -137,14 +151,13 @@ def openpi_arm_state_to_i2rt(state: np.ndarray) -> np.ndarray:
     return i2rt_arm_state_to_openpi(state)
 
 
-def _parse_image(image) -> np.ndarray:
-    image = np.asarray(image)
-    if np.issubdtype(image.dtype, np.floating):
-        image = (255 * np.clip(image, 0.0, 1.0)).astype(np.uint8)
-    if image.ndim != 3:
-        raise ValueError(f"Expected image rank 3, got {image.shape}")
-    if image.shape[0] == 3:
-        return einops.rearrange(image, "c h w -> h w c")
-    if image.shape[-1] == 3:
-        return image.astype(np.uint8, copy=False)
-    raise ValueError(f"Expected CHW or HWC RGB image, got {image.shape}")
+def _parse_image(image) -> tuple[np.ndarray, str | None]:
+    if isinstance(image, bytes | bytearray | memoryview):
+        decoded = jpeg_transport.decode_rgb_jpeg(image)
+        if decoded.shape[:2] != jpeg_transport.IMAGE_RESOLUTION:
+            raise ValueError(
+                "YAM JPEG transport images must already be resized to "
+                f"{jpeg_transport.IMAGE_RESOLUTION}, got {decoded.shape[:2]}"
+            )
+        return decoded, jpeg_transport.IMAGE_TRANSPORT
+    return jpeg_transport.as_rgb_uint8(image), None

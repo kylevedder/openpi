@@ -15,6 +15,7 @@ from openpi_client import websocket_client_policy
 import tyro
 
 from examples.yam_real import common
+from openpi.shared import jpeg_transport
 
 
 @dataclasses.dataclass
@@ -35,6 +36,7 @@ class Args:
     response_status_interval_s: float | None = 5.0
     per_step_log_interval: int = 1
     log_dir: Path = Path("yam_data/logs/run_policy")
+    image_transport: Literal["auto", "raw", "jpeg_q85_224_rgb_v1"] = "auto"
 
 
 def main(args: Args) -> None:
@@ -73,9 +75,10 @@ def _run_policy(args: Args) -> None:
         response_status_interval_s=args.response_status_interval_s,
         status_callback=_log,
     )
-    _validate_server_metadata(
-        ws_policy.get_server_metadata(), expected_fps=args.fps, expected_action_horizon=args.action_horizon
-    )
+    server_metadata = ws_policy.get_server_metadata()
+    _validate_server_metadata(server_metadata, expected_fps=args.fps, expected_action_horizon=args.action_horizon)
+    image_transport = _resolve_image_transport(server_metadata, args.image_transport)
+    _log(f"Using image_transport={image_transport}")
     gripper_type = GripperType.from_string_name(args.gripper)
     robots = []
 
@@ -128,7 +131,7 @@ def _run_policy(args: Args) -> None:
                     camera_ms = _elapsed_ms(camera_start)
 
                     image_start = time.monotonic()
-                    images = _policy_images(frames)
+                    images = _policy_images(frames, image_transport=image_transport)
                     image_ms = _elapsed_ms(image_start)
                     obs_ms = _elapsed_ms(obs_start)
                     observation = {
@@ -139,7 +142,8 @@ def _run_policy(args: Args) -> None:
                     _log(
                         f"step={step}: requesting action chunk "
                         f"(horizon={args.action_horizon}, obs_ms={obs_ms:.1f}, state_ms={state_ms:.1f}, "
-                        f"camera_ms={camera_ms:.1f}, image_ms={image_ms:.1f})"
+                        f"camera_ms={camera_ms:.1f}, image_ms={image_ms:.1f}, "
+                        f"image_transport={image_transport})"
                     )
                     infer_start = time.monotonic()
                     result = ws_policy.infer(observation)
@@ -231,12 +235,17 @@ def _run_policy(args: Args) -> None:
         _log("Policy runner stopped")
 
 
-def _policy_images(frames_bgr: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def _policy_images(frames_bgr: dict[str, np.ndarray], *, image_transport: str) -> dict[str, np.ndarray | bytes]:
     images = {}
     for name, frame_bgr in frames_bgr.items():
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        rgb = image_tools.convert_to_uint8(image_tools.resize_with_pad(rgb, 224, 224))
-        images[name] = np.transpose(rgb, (2, 0, 1))
+        rgb = image_tools.convert_to_uint8(image_tools.resize_with_pad(rgb, *jpeg_transport.IMAGE_RESOLUTION))
+        if image_transport == jpeg_transport.IMAGE_TRANSPORT:
+            images[name] = jpeg_transport.encode_rgb_jpeg(rgb)
+        elif image_transport == "raw":
+            images[name] = np.transpose(rgb, (2, 0, 1))
+        else:
+            raise ValueError(f"Unsupported image_transport={image_transport!r}")
     return images
 
 
@@ -340,6 +349,21 @@ def _normalize_policy_host(host: str) -> str:
     return host
 
 
+def _resolve_image_transport(
+    metadata: dict[str, Any],
+    requested_image_transport: Literal["auto", "raw", "jpeg_q85_224_rgb_v1"],
+) -> str:
+    server_image_transport = metadata.get("image_transport", "raw")
+    if requested_image_transport == "auto":
+        return server_image_transport
+    if requested_image_transport != server_image_transport:
+        raise RuntimeError(
+            "Policy image_transport mismatch: "
+            f"server advertises {server_image_transport!r}, requested {requested_image_transport!r}"
+        )
+    return requested_image_transport
+
+
 def _validate_server_metadata(metadata: dict[str, Any], *, expected_fps: float, expected_action_horizon: int) -> None:
     action_space = metadata.get("action_space")
     if action_space != common.ACTION_SPACE:
@@ -365,10 +389,27 @@ def _validate_server_metadata(metadata: dict[str, Any], *, expected_fps: float, 
     if fps is None or abs(float(fps) - float(expected_fps)) > 1e-6:
         raise RuntimeError(f"Policy fps mismatch: expected {expected_fps!r}, got {fps!r}")
 
+    image_transport = metadata.get("image_transport", "raw")
+    if image_transport not in ("raw", jpeg_transport.IMAGE_TRANSPORT):
+        raise RuntimeError(f"Unsupported policy image_transport: {image_transport!r}")
+    if image_transport == jpeg_transport.IMAGE_TRANSPORT:
+        jpeg_quality = metadata.get("jpeg_quality")
+        if jpeg_quality != jpeg_transport.JPEG_QUALITY:
+            raise RuntimeError(
+                f"Policy jpeg_quality mismatch: expected {jpeg_transport.JPEG_QUALITY!r}, got {jpeg_quality!r}"
+            )
+
+        image_resolution = metadata.get("image_resolution")
+        if image_resolution is None or tuple(image_resolution) != jpeg_transport.IMAGE_RESOLUTION:
+            raise RuntimeError(
+                "Policy image_resolution mismatch: "
+                f"expected {jpeg_transport.IMAGE_RESOLUTION!r}, got {image_resolution!r}"
+            )
+
     print(
         "server metadata OK: "
         f"action_space={action_space}, gripper_convention={gripper_convention}, state_dim={len(state_order)}, "
-        f"action_horizon={action_horizon}, fps={fps}"
+        f"action_horizon={action_horizon}, fps={fps}, image_transport={image_transport}"
     )
 
 

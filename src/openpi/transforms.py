@@ -10,6 +10,7 @@ from openpi_client import image_tools
 
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
+from openpi.shared import jpeg_transport
 from openpi.shared import normalize as _normalize
 
 DataDict: TypeAlias = at.PyTree
@@ -188,6 +189,19 @@ class ResizeImages(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class JpegRoundTripImages(DataTransformFn):
+    quality: int = jpeg_transport.JPEG_QUALITY
+    transport: str = jpeg_transport.IMAGE_TRANSPORT
+    marker_key: str = jpeg_transport.MARKER_KEY
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if data.pop(self.marker_key, None) == self.transport:
+            return data
+        data["image"] = jpeg_transport.jpeg_roundtrip_images(data["image"], quality=self.quality)
         return data
 
 

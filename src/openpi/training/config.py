@@ -22,6 +22,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
+import openpi.shared.jpeg_transport as jpeg_transport
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -164,6 +165,30 @@ class ModelTransformFactory(GroupFactory):
                 )
 
 
+def _make_yam_model_transforms(
+    *,
+    default_prompt: str | None,
+    image_transport: Literal["raw", "jpeg_q85_224_rgb_v1"],
+    model_config: _model.BaseModelConfig,
+) -> _transforms.Group:
+    model_transforms = ModelTransformFactory(default_prompt=default_prompt)(model_config)
+    if image_transport == "raw":
+        return model_transforms
+    if image_transport != jpeg_transport.IMAGE_TRANSPORT:
+        raise ValueError(f"Unsupported YAM image transport: {image_transport!r}")
+
+    inputs = []
+    inserted = False
+    for transform in model_transforms.inputs:
+        inputs.append(transform)
+        if isinstance(transform, _transforms.ResizeImages):
+            inputs.append(_transforms.JpegRoundTripImages())
+            inserted = True
+    if not inserted:
+        raise ValueError("YAM JPEG transport requires a ResizeImages model transform")
+    return dataclasses.replace(model_transforms, inputs=tuple(inputs))
+
+
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
@@ -285,6 +310,7 @@ class LeRobotYamDataConfig(DataConfigFactory):
     # Gripper dimensions remain absolute.
     use_delta_joint_actions: bool = True
     default_prompt: str | None = None
+    image_transport: Literal["raw", "jpeg_q85_224_rgb_v1"] = "raw"
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -319,7 +345,11 @@ class LeRobotYamDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        model_transforms = _make_yam_model_transforms(
+            default_prompt=self.default_prompt,
+            image_transport=self.image_transport,
+            model_config=model_config,
+        )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -913,6 +943,30 @@ _CONFIGS = [
             "state_order": list(yam_policy.STATE_ORDER),
             "action_horizon": 50,
             "fps": 50.0,
+        },
+    ),
+    TrainConfig(
+        name="pi05_yam_bimanual_50hz_jpeg_q85",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotYamDataConfig(
+            repo_id="local/yam_bimanual",
+            base_config=DataConfig(prompt_from_task=True),
+            default_prompt="perform the demonstrated bimanual task",
+            image_transport=jpeg_transport.IMAGE_TRANSPORT,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        policy_metadata={
+            "reset_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "action_space": yam_policy.ACTION_SPACE,
+            "gripper_convention": yam_policy.GRIPPER_CONVENTION,
+            "state_order": list(yam_policy.STATE_ORDER),
+            "action_horizon": 50,
+            "fps": 50.0,
+            "image_transport": jpeg_transport.IMAGE_TRANSPORT,
+            "jpeg_quality": jpeg_transport.JPEG_QUALITY,
+            "image_resolution": list(jpeg_transport.IMAGE_RESOLUTION),
         },
     ),
     #
