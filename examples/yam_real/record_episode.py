@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from pathlib import Path
+import shutil
 import time
 from typing import Literal
 
@@ -23,7 +24,7 @@ class Args:
     output_dir: Path = Path("yam_data/raw")
     episode_name: str | None = None
     task: str = "perform the demonstrated bimanual task"
-    fps: float = 20.0
+    fps: float = 50.0
     max_duration_s: float | None = None
     gripper: Literal["crank_4310", "linear_3507", "linear_4310"] = "linear_4310"
     bilateral_kp: float = 0.2
@@ -31,6 +32,7 @@ class Args:
     use_gravity_comp: bool = False
     status_haptic_cue: bool = True
     status_cue_gain: float = 0.08
+    record_button_debounce_s: float = 1.0
     record_only_when_synced: bool = True
     startup_check_only: bool = False
 
@@ -133,19 +135,55 @@ class TeleopPair:
             time.sleep(duration_s / steps)
 
 
+def _make_next_episode_dir(output_dir: Path, requested_name: str | None, episode_index: int) -> Path:
+    if requested_name is None:
+        base_name = time.strftime("episode_%Y%m%d_%H%M%S")
+    elif episode_index == 1:
+        base_name = requested_name
+    else:
+        base_name = f"{requested_name}_{episode_index:03d}"
+
+    for suffix in range(1000):
+        episode_name = base_name if suffix == 0 else f"{base_name}_{suffix:02d}"
+        try:
+            return common.make_episode_dir(output_dir, episode_name)
+        except FileExistsError:
+            continue
+
+    raise FileExistsError(f"Could not create a unique episode directory under {output_dir}")
+
+
+def _print_recording_banner(title: str, details: list[str] | None = None) -> None:
+    width = 72
+    inner_width = width - 4
+    print()
+    print("#" * width)
+    print(f"# {title.center(inner_width)} #")
+    if details:
+        print(f"# {' '.center(inner_width)} #")
+        for detail in details:
+            line = f"{detail[: inner_width - 3]}..." if len(detail) > inner_width else detail
+            print(f"# {line.center(inner_width)} #")
+    print("#" * width)
+    print(flush=True)
+
+
 def main(args: Args) -> None:
+    if args.record_button_debounce_s < 0:
+        raise ValueError("--record-button-debounce-s must be non-negative")
+
     common.ensure_i2rt_importable()
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import GripperType
 
     gripper_type = GripperType.from_string_name(args.gripper)
-    episode_dir = common.make_episode_dir(args.output_dir, args.episode_name)
-    print(f"Recording directory: {episode_dir}")
+    print(f"Output root: {args.output_dir}")
     print("Controls: leader top buttons toggle sync per side; leader bottom button or 'r' starts/stops and saves.")
-    print("'q' stops and saves without toggling recording.")
+    print("'q' saves any active recording and exits.")
     print("Recording haptic cue: one leader pulse=start, two leader pulses=stop.")
 
     robots = []
+    episode_dir: Path | None = None
     states: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     timestamps: list[float] = []
@@ -155,14 +193,22 @@ def main(args: Args) -> None:
     frame_idx = 0
     next_record_t = time.monotonic()
     last_record_button = 0.0
-    episode_saved = False
+    last_record_button_toggle_t = -float("inf")
+    episode_index = 0
 
-    def save_episode() -> None:
-        nonlocal episode_saved
-        if episode_saved:
-            return
-        if not states:
-            raise RuntimeError("No frames recorded. Enable sync and toggle recording before stopping.")
+    def reset_episode_buffers() -> None:
+        nonlocal frame_idx, start_time, next_record_t
+        states.clear()
+        actions.clear()
+        timestamps.clear()
+        image_paths.clear()
+        frame_idx = 0
+        start_time = None
+        next_record_t = time.monotonic()
+
+    def save_episode() -> bool:
+        if episode_dir is None or not states:
+            return False
 
         np.savez_compressed(
             episode_dir / "episode.npz",
@@ -184,21 +230,68 @@ def main(args: Args) -> None:
             num_frames=len(states),
         )
         manifest.write(episode_dir / "manifest.json")
-        episode_saved = True
         print(f"Recorded {len(states)} frames to {episode_dir}")
+        return True
 
-    def toggle_recording() -> bool:
-        nonlocal recording, start_time, next_record_t
-        was_recording = recording
-        recording = not recording
+    def start_episode() -> None:
+        nonlocal episode_dir, episode_index, recording, start_time, next_record_t
+        if recording:
+            return
+        if states:
+            save_episode()
+            reset_episode_buffers()
+
+        episode_index += 1
+        episode_dir = _make_next_episode_dir(args.output_dir, args.episode_name, episode_index)
+        reset_episode_buffers()
+        recording = True
+        start_time = time.monotonic()
+        next_record_t = start_time
         print(f"recording={recording}")
-        if recording and start_time is None:
-            start_time = time.monotonic()
-        next_record_t = time.monotonic()
+        print(f"Recording directory: {episode_dir}")
+        _print_recording_banner(
+            "RECORDING STARTED",
+            [
+                f"Episode: {episode_dir}",
+                f"FPS: {args.fps:g}",
+            ],
+        )
         if args.status_haptic_cue:
-            pair_l.emit_recording_status(recording=recording, gain=args.status_cue_gain)
-            pair_r.emit_recording_status(recording=recording, gain=args.status_cue_gain)
-        return was_recording and not recording
+            pair_l.emit_recording_status(recording=True, gain=args.status_cue_gain)
+            pair_r.emit_recording_status(recording=True, gain=args.status_cue_gain)
+
+    def stop_episode() -> None:
+        nonlocal episode_dir, recording
+        was_recording = recording
+        recording = False
+        if was_recording:
+            print(f"recording={recording}")
+            _print_recording_banner(
+                "RECORDING STOPPED",
+                [
+                    f"Frames captured: {len(states)}",
+                    "Saving episode now",
+                ],
+            )
+            if args.status_haptic_cue:
+                pair_l.emit_recording_status(recording=False, gain=args.status_cue_gain)
+                pair_r.emit_recording_status(recording=False, gain=args.status_cue_gain)
+
+        saved = save_episode()
+        if saved:
+            print("Ready for next episode.")
+        elif episode_dir is not None:
+            print("No frames recorded; discarding empty episode directory.")
+            shutil.rmtree(episode_dir, ignore_errors=True)
+
+        episode_dir = None
+        reset_episode_buffers()
+
+    def toggle_recording() -> None:
+        if recording:
+            stop_episode()
+        else:
+            start_episode()
 
     try:
         follower_l = get_yam_robot(
@@ -258,27 +351,34 @@ def main(args: Args) -> None:
             while True:
                 key = common.read_key_nonblocking()
                 if key == "q":
-                    if recording:
-                        toggle_recording()
+                    if recording or states:
+                        stop_episode()
                     break
-                if key == "r" and toggle_recording():
-                    break
+                if key == "r":
+                    toggle_recording()
 
                 state_l, action_l, buttons_l = pair_l.step()
                 state_r, action_r, buttons_r = pair_r.step()
+                now = time.monotonic()
                 record_button = max(
                     float(buttons_l[RECORD_BUTTON_INDEX]) if buttons_l.size > RECORD_BUTTON_INDEX else 0.0,
                     float(buttons_r[RECORD_BUTTON_INDEX]) if buttons_r.size > RECORD_BUTTON_INDEX else 0.0,
                 )
-                if record_button > 0.5 and last_record_button <= 0.5 and toggle_recording():
-                    break
+                if record_button > 0.5 and last_record_button <= 0.5:
+                    if now - last_record_button_toggle_t >= args.record_button_debounce_s:
+                        toggle_recording()
+                        last_record_button_toggle_t = now
+                    else:
+                        remaining_s = args.record_button_debounce_s - (now - last_record_button_toggle_t)
+                        print(f"Ignoring record button bounce ({remaining_s:.2f}s debounce remaining).")
                 last_record_button = record_button
-                now = time.monotonic()
                 should_record = recording and now >= next_record_t
                 if args.record_only_when_synced and not (pair_l.synchronized and pair_r.synchronized):
                     should_record = False
 
                 if should_record:
+                    if episode_dir is None:
+                        raise RuntimeError("Recording is active without an episode directory.")
                     frames = cameras.read()
                     image_paths.append(common.save_frames(episode_dir, frame_idx, frames))
                     states.append(common.pack_bimanual(state_l, state_r))
@@ -291,20 +391,19 @@ def main(args: Args) -> None:
                     args.max_duration_s is not None
                     and start_time is not None
                     and time.monotonic() - start_time >= args.max_duration_s
+                    and recording
                 ):
-                    if recording:
-                        toggle_recording()
-                    break
+                    stop_episode()
 
                 time.sleep(0.005)
     except KeyboardInterrupt:
         print("Interrupted; saving recorded frames before exit.")
+        if recording or states:
+            stop_episode()
     finally:
         for robot in robots:
             with contextlib.suppress(Exception):
                 robot.close()
-
-    save_episode()
 
 
 if __name__ == "__main__":

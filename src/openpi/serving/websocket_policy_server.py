@@ -52,23 +52,44 @@ class WebsocketPolicyServer:
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None
+        prev_response_send_time = None
+        prev_response_bytes = None
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                request = await websocket.recv()
+                request_recv_wait_time = time.monotonic() - start_time
+                request_unpack_start = time.monotonic()
+                obs = msgpack_numpy.unpackb(request)
+                request_unpack_time = time.monotonic() - request_unpack_start
 
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
+                    "request_recv_wait_ms": request_recv_wait_time * 1000,
+                    "request_bytes": len(request),
+                    "request_unpack_ms": request_unpack_time * 1000,
                     "infer_ms": infer_time * 1000,
                 }
                 if prev_total_time is not None:
                     # We can only record the last total time since we also want to include the send time.
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
+                    action["server_timing"]["prev_response_send_ms"] = prev_response_send_time * 1000
+                    action["server_timing"]["prev_response_bytes"] = prev_response_bytes
 
-                await websocket.send(packer.pack(action))
+                response_pack_start = time.monotonic()
+                response = packer.pack(action)
+                response_pack_time = time.monotonic() - response_pack_start
+                action["server_timing"]["response_pack_ms_approx"] = response_pack_time * 1000
+                action["server_timing"]["response_bytes_approx"] = len(response)
+                response = packer.pack(action)
+
+                response_send_start = time.monotonic()
+                await websocket.send(response)
+                prev_response_send_time = time.monotonic() - response_send_start
+                prev_response_bytes = len(response)
                 prev_total_time = time.monotonic() - start_time
 
             except websockets.ConnectionClosed:

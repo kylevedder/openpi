@@ -51,15 +51,16 @@ Run from the `openpi` repo root:
 uv run python -m examples.yam_real.record_episode \
   --output-dir yam_data/raw \
   --task "pick up the object and place it in the target area" \
-  --fps 20
+  --fps 50
 ```
 
 Controls:
 
 - Press the top button on each leader handle to enable sync for that side.
 - Press the bottom button on either leader handle, or `r` in the terminal, to start recording.
-- Press the bottom button or `r` again to stop recording, save the full episode, and exit.
-- Press `q` to save and exit without toggling recording.
+- Press the bottom button or `r` again to stop recording, save the full episode, and stay ready for the next one.
+- Repeat start/stop to record back-to-back episodes without restarting the robot process.
+- Press `q` to save any active recording and exit.
 
 Recording status is also echoed on the leader arms as a haptic cue: one short pulse means recording started; two short
 pulses means recording stopped. Disable this with `--no-status-haptic-cue` if it is distracting.
@@ -96,13 +97,23 @@ Replay applies per-step delta limits before commanding the followers.
 
 ## 3. Convert to LeRobot
 
+Create an explicit training manifest so conversion uses only the selected demos:
+
+```bash
+uv run python -m examples.yam_real.build_episode_manifest \
+  --raw-dir yam_data/raw \
+  --output yam_data/manifests/pi05_yam_bimanual_50hz_20demo.txt \
+  --min-frames 1
+```
+
 ```bash
 uv run python -m examples.yam_real.convert_yam_data_to_lerobot \
   --raw-dir yam_data/raw \
+  --episode-manifest yam_data/manifests/pi05_yam_bimanual_50hz_20demo.txt \
   --repo-id local/yam_bimanual
 ```
 
-The OpenPI config `pi05_yam_bimanual` expects this repo id by default.
+The OpenPI config `pi05_yam_bimanual_50hz` expects this repo id by default.
 
 ## 4. Modal GPU Training
 
@@ -112,13 +123,26 @@ Install and authenticate Modal locally, then run:
 uv pip install modal
 modal volume create yam-openpi
 modal volume put yam-openpi ~/.cache/huggingface/lerobot/local/yam_bimanual /lerobot/local/yam_bimanual -f
-modal run examples/yam_real/modal_app.py::compute_norm_stats
-modal run examples/yam_real/modal_app.py::train --num-train-steps 100 --overwrite
+modal run examples/yam_real/modal_app.py::compute_norm_stats --config-name pi05_yam_bimanual_50hz
+modal run examples/yam_real/modal_app.py::train_fsdp2 \
+  --config-name pi05_yam_bimanual_50hz \
+  --exp-name yam_bimanual_50hz_20demo_v1 \
+  --num-train-steps 1000 \
+  --batch-size 8 \
+  --overwrite
 ```
 
-Use the short run first to validate the pipeline. For a real run, omit `--num-train-steps 100` or set a larger value.
+Use the short run first to validate the pipeline. For a real run over the full 20k-step config, omit
+`--num-train-steps 100`:
 
-Before serving, set `SERVE_CHECKPOINT_STEP` in `examples/yam_real/modal_app.py` to the checkpoint step you want to serve.
+```bash
+modal run --detach examples/yam_real/modal_app.py::train_fsdp2 \
+  --config-name pi05_yam_bimanual_50hz \
+  --exp-name yam_bimanual_50hz_20demo_v1 \
+  --batch-size 8
+```
+
+The Modal serving entrypoint is configured to serve checkpoint step `999` from `yam_bimanual_50hz_20demo_v1`.
 
 ```bash
 modal deploy examples/yam_real/modal_app.py
@@ -128,19 +152,51 @@ The `serve_policy` endpoint runs OpenPI's websocket policy server on port `8000`
 
 ## 5. Policy Playback
 
+Each `run_policy` invocation tees stdout and stderr to a timestamped log under
+`yam_data/logs/run_policy/`. The most recent run is always available at:
+
+```bash
+yam_data/logs/run_policy/latest.log
+```
+
 Use dry-run first. The robot host sends observations and prints policy actions but does not command the followers:
 
 ```bash
 uv run python -m examples.yam_real.run_policy \
   --host wss://<modal-endpoint-host> \
-  --prompt "pick up the object and place it in the target area"
+  --prompt "pick up the object and place it in the target area" \
+  --max-steps 40 \
+  --fps 50 \
+  --action-horizon 50 \
+  --use-gravity-comp
 ```
 
-Execute only after dry-run returns sane 14D actions:
+Run a short bounded execute with an empty workspace only after dry-run returns sane 14D actions:
 
 ```bash
 uv run python -m examples.yam_real.run_policy \
   --host wss://<modal-endpoint-host> \
   --prompt "pick up the object and place it in the target area" \
+  --max-steps 50 \
+  --fps 50 \
+  --action-horizon 50 \
+  --max-arm-step-rad 0.01 \
+  --max-gripper-step 0.01 \
+  --use-gravity-comp \
+  --execute
+```
+
+Then run the task with the normal per-step limits:
+
+```bash
+uv run python -m examples.yam_real.run_policy \
+  --host wss://<modal-endpoint-host> \
+  --prompt "pick up the object and place it in the target area" \
+  --max-steps 200 \
+  --fps 50 \
+  --action-horizon 50 \
+  --max-arm-step-rad 0.02 \
+  --max-gripper-step 0.02 \
+  --use-gravity-comp \
   --execute
 ```

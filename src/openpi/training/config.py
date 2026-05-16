@@ -895,6 +895,26 @@ _CONFIGS = [
             "state_order": list(yam_policy.STATE_ORDER),
         },
     ),
+    TrainConfig(
+        name="pi05_yam_bimanual_50hz",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotYamDataConfig(
+            repo_id="local/yam_bimanual",
+            base_config=DataConfig(prompt_from_task=True),
+            default_prompt="perform the demonstrated bimanual task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        policy_metadata={
+            "reset_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "action_space": yam_policy.ACTION_SPACE,
+            "gripper_convention": yam_policy.GRIPPER_CONVENTION,
+            "state_order": list(yam_policy.STATE_ORDER),
+            "action_horizon": 50,
+            "fps": 50.0,
+        },
+    ),
     #
     # Fine-tuning DROID configs.
     #
