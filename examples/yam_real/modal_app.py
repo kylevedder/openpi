@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import subprocess
+import sys
 
 import modal
 
@@ -11,6 +13,8 @@ VOLUME_ROOT = "/mnt/yam"
 CONFIG_NAME = "pi05_yam_bimanual_50hz_jpeg_q85"
 DEFAULT_EXP_NAME = "yam_bimanual_50hz_jpeg_q85_20demo_v1"
 SERVE_CHECKPOINT_STEP = 999
+QUIC_REGIONS = ["us-west-1", "westus"]
+QUIC_SCALEDOWN_WINDOW_S = 20 * 60
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name("yam-openpi", create_if_missing=True)
@@ -24,6 +28,25 @@ def _openpi_source_root() -> Path:
     if container_root.exists():
         return container_root
     raise RuntimeError("Could not locate the OpenPI repo root")
+
+
+def _ensure_openpi_importable() -> None:
+    venv_site_packages = (
+        Path(OPENPI_ROOT)
+        / ".venv"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    import_paths = [
+        Path(OPENPI_ROOT),
+        Path(OPENPI_ROOT) / "src",
+        Path(OPENPI_ROOT) / "packages" / "openpi-client" / "src",
+        venv_site_packages,
+    ]
+    for import_path in reversed(import_paths):
+        if import_path.exists() and str(import_path) not in sys.path:
+            sys.path.insert(0, str(import_path))
 
 
 image = (
@@ -133,6 +156,60 @@ def serve_policy() -> None:
         f"--policy.dir={checkpoint_dir}",
     ]
     subprocess.Popen(cmd, cwd=OPENPI_ROOT)
+
+
+@app.cls(
+    image=image,
+    gpu="A100-40GB",
+    volumes={VOLUME_ROOT: volume},
+    timeout=24 * 60 * 60,
+    scaledown_window=QUIC_SCALEDOWN_WINDOW_S,
+    region=QUIC_REGIONS,
+    experimental_options={"region_ranking_enabled": True},
+    max_containers=3,
+)
+class YamQuicPolicyServer:
+    @modal.enter()
+    def enter(self) -> None:
+        logging.basicConfig(level=logging.INFO, force=True)
+        _ensure_openpi_importable()
+        _prepare_volume_paths()
+        checkpoint_dir = f"checkpoints/{CONFIG_NAME}/{DEFAULT_EXP_NAME}/{SERVE_CHECKPOINT_STEP}"
+        checkpoint_path = Path(OPENPI_ROOT) / checkpoint_dir
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_path}")
+        if not (checkpoint_path / "params").exists():
+            raise FileNotFoundError(f"Checkpoint params directory does not exist: {checkpoint_path / 'params'}")
+
+        from openpi.policies import policy_config
+        from openpi.training import config as training_config
+
+        logging.info("Loading YAM QUIC policy from %s", checkpoint_dir)
+        self.policy = policy_config.create_trained_policy(
+            training_config.get_config(CONFIG_NAME),
+            str(checkpoint_path),
+        )
+        self.metadata = dict(self.policy.metadata)
+        self.metadata.update(
+            {
+                "transport": "modal-quic",
+                "modal_app": APP_NAME,
+                "modal_class": type(self).__name__,
+                "regions": QUIC_REGIONS,
+            }
+        )
+        logging.info("YAM QUIC policy loaded")
+
+    @modal.method()
+    def serve(self, rendezvous: modal.Dict) -> None:
+        _ensure_openpi_importable()
+        from openpi.serving import modal_quic
+
+        modal_quic.serve_policy(
+            rendezvous=rendezvous,
+            policy=self.policy,
+            metadata=self.metadata,
+        )
 
 
 def _train_cmd(

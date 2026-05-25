@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import dataclasses
 from pathlib import Path
@@ -15,13 +16,22 @@ from openpi_client import websocket_client_policy
 import tyro
 
 from examples.yam_real import common
+from openpi.serving import modal_quic
 from openpi.shared import jpeg_transport
 
 
 @dataclasses.dataclass
 class Args:
+    transport: Literal["websocket", "modal-quic"] = "websocket"
     host: str = "localhost"
     port: int = 8000
+    modal_app_name: str = "yam-openpi"
+    modal_class_name: str = "YamQuicPolicyServer"
+    modal_method_name: str = "serve"
+    modal_region: str | None = None
+    modal_gpu: str | None = None
+    modal_server_start_timeout_s: float = 20 * 60
+    modal_punch_timeout_s: int = 10
     prompt: str = "perform the demonstrated bimanual task"
     execute: bool = False
     fps: float = 50.0
@@ -37,6 +47,30 @@ class Args:
     per_step_log_interval: int = 1
     log_dir: Path = Path("yam_data/logs/run_policy")
     image_transport: Literal["auto", "raw", "jpeg_q85_224_rgb_v1"] = "auto"
+    prefetch_action_chunks: bool = True
+    prefetch_remaining_steps: int = 30
+
+
+@dataclasses.dataclass
+class _CapturedObservation:
+    state: np.ndarray
+    frames_bgr: dict[str, np.ndarray]
+    capture_ms: float
+    state_ms: float
+    camera_ms: float
+
+
+@dataclasses.dataclass
+class _ChunkResult:
+    actions: np.ndarray
+    capture_ms: float
+    state_ms: float
+    camera_ms: float
+    image_ms: float
+    obs_ms: float
+    roundtrip_ms: float
+    server_timing: dict[str, Any]
+    client_timing: dict[str, Any]
 
 
 def main(args: Args) -> None:
@@ -58,24 +92,15 @@ def _run_policy(args: Args) -> None:
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import GripperType
 
-    policy_host = _normalize_policy_host(args.host)
-    policy_port = None if policy_host.startswith("ws") else args.port
-    policy_endpoint = policy_host if policy_port is None else f"{policy_host}:{policy_port}"
+    policy_endpoint = _policy_endpoint(args)
     _log(
-        f"execute={args.execute}; host={policy_endpoint}; max_steps={args.max_steps}; "
+        f"execute={args.execute}; transport={args.transport}; endpoint={policy_endpoint}; max_steps={args.max_steps}; "
         f"fps={args.fps:g}; action_horizon={args.action_horizon}"
     )
     if not args.execute:
         _log("Dry run only. Observations will be sent to the server, but followers will not be commanded.")
-    ws_policy = websocket_client_policy.WebsocketClientPolicy(
-        host=policy_host,
-        port=policy_port,
-        connect_timeout_s=args.connect_timeout_s,
-        retry_interval_s=args.connection_retry_interval_s,
-        response_status_interval_s=args.response_status_interval_s,
-        status_callback=_log,
-    )
-    server_metadata = ws_policy.get_server_metadata()
+    policy_client = _create_policy_client(args)
+    server_metadata = policy_client.get_server_metadata()
     _validate_server_metadata(server_metadata, expected_fps=args.fps, expected_action_horizon=args.action_horizon)
     image_transport = _resolve_image_transport(server_metadata, args.image_transport)
     _log(f"Using image_transport={image_transport}")
@@ -110,129 +135,211 @@ def _run_policy(args: Args) -> None:
             chunk_actions: np.ndarray | None = None
             chunk_step = args.action_horizon
             chunk_index = -1
-            _log("Starting policy loop")
-            for step in range(args.max_steps):
-                loop_start = time.monotonic()
-                state_ms = camera_ms = image_ms = server_ms = obs_ms = None
-                server_model_ms = server_prev_total_ms = None
-                client_pack_ms = client_send_ms = client_recv_wait_ms = client_unpack_ms = client_total_ms = None
-                request_bytes = response_bytes = None
-                request_new_chunk = chunk_actions is None or chunk_step >= len(chunk_actions)
-                if request_new_chunk:
-                    obs_start = time.monotonic()
-                    state_start = time.monotonic()
-                    state = common.pack_bimanual(
-                        common.get_follower_state(follower_l), common.get_follower_state(follower_r)
+            pending_chunk: concurrent.futures.Future[_ChunkResult] | None = None
+            prefetch_remaining_steps = max(0, min(args.prefetch_remaining_steps, args.action_horizon - 1))
+            _log(
+                "Starting policy loop "
+                f"(prefetch_action_chunks={args.prefetch_action_chunks}, "
+                f"prefetch_remaining_steps={prefetch_remaining_steps})"
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as chunk_executor:
+                for step in range(args.max_steps):
+                    loop_start = time.monotonic()
+                    state_ms = camera_ms = image_ms = server_ms = obs_ms = None
+                    server_model_ms = server_prev_total_ms = server_prev_active_ms = None
+                    client_pack_ms = client_send_ms = client_recv_wait_ms = client_unpack_ms = client_total_ms = None
+                    request_bytes = response_bytes = None
+                    chunk_source = "cache"
+                    request_new_chunk = chunk_actions is None or chunk_step >= len(chunk_actions)
+                    if request_new_chunk:
+                        if pending_chunk is not None:
+                            if not pending_chunk.done():
+                                _log(f"step={step}: waiting for prefetched action chunk")
+                            chunk_result = pending_chunk.result()
+                            pending_chunk = None
+                            chunk_source = "prefetch"
+                        else:
+                            captured = _capture_policy_observation(follower_l, follower_r, cameras)
+                            _log(
+                                f"step={step}: requesting action chunk "
+                                f"(horizon={args.action_horizon}, capture_ms={captured.capture_ms:.1f}, "
+                                f"state_ms={captured.state_ms:.1f}, camera_ms={captured.camera_ms:.1f}, "
+                                f"image_transport={image_transport})"
+                            )
+                            chunk_result = _infer_action_chunk(
+                                policy_client,
+                                captured,
+                                prompt=args.prompt,
+                                image_transport=image_transport,
+                            )
+                            chunk_source = "server"
+
+                        chunk_actions = chunk_result.actions
+                        _validate_action_chunk(chunk_actions, expected_horizon=args.action_horizon)
+                        chunk_step = 0
+                        chunk_index += 1
+                        state_ms = chunk_result.state_ms
+                        camera_ms = chunk_result.camera_ms
+                        image_ms = chunk_result.image_ms
+                        obs_ms = chunk_result.obs_ms
+                        server_ms = chunk_result.roundtrip_ms
+                        server_timing = chunk_result.server_timing
+                        server_model_ms = _optional_float(server_timing.get("infer_ms"))
+                        server_prev_total_ms = _optional_float(server_timing.get("prev_total_ms"))
+                        server_prev_active_ms = _optional_float(server_timing.get("prev_handler_active_ms"))
+                        client_timing = chunk_result.client_timing
+                        client_pack_ms = _optional_float(client_timing.get("pack_ms"))
+                        client_send_ms = _optional_float(client_timing.get("send_ms"))
+                        client_recv_wait_ms = _optional_float(client_timing.get("recv_wait_ms"))
+                        client_unpack_ms = _optional_float(client_timing.get("unpack_ms"))
+                        client_total_ms = _optional_float(client_timing.get("total_ms"))
+                        request_bytes = _optional_int(client_timing.get("request_bytes"))
+                        response_bytes = _optional_int(client_timing.get("response_bytes"))
+                        _log(
+                            f"step={step}: received chunk={chunk_index} source={chunk_source} shape={chunk_actions.shape} "
+                            f"roundtrip_ms={server_ms:.1f} server_model_ms={_format_optional_ms(server_model_ms)} "
+                            f"server_prev_total_ms={_format_optional_ms(server_prev_total_ms)} "
+                            f"server_prev_active_ms={_format_optional_ms(server_prev_active_ms)} "
+                            f"client_pack_ms={_format_optional_ms(client_pack_ms)} "
+                            f"client_send_ms={_format_optional_ms(client_send_ms)} "
+                            f"client_recv_wait_ms={_format_optional_ms(client_recv_wait_ms)} "
+                            f"client_unpack_ms={_format_optional_ms(client_unpack_ms)} "
+                            f"request_bytes={_format_optional_int(request_bytes)} "
+                            f"response_bytes={_format_optional_int(response_bytes)}"
+                        )
+
+                    action = chunk_actions[chunk_step]
+                    action_step = chunk_step
+                    chunk_step += 1
+
+                    previous_command = command
+                    command = common.clip_bimanual_delta(
+                        command,
+                        action,
+                        max_arm_step_rad=args.max_arm_step_rad,
+                        max_gripper_step=args.max_gripper_step,
                     )
-                    state_ms = _elapsed_ms(state_start)
 
-                    camera_start = time.monotonic()
-                    frames = cameras.read()
-                    camera_ms = _elapsed_ms(camera_start)
+                    pre_command_wait_s = next_command_t - time.monotonic()
+                    if pre_command_wait_s > 0:
+                        time.sleep(pre_command_wait_s)
+                    command_t = time.monotonic()
+                    command_period_ms = None if last_command_t is None else 1000.0 * (command_t - last_command_t)
+                    command_late_ms = max(0.0, 1000.0 * (command_t - next_command_t))
+                    last_command_t = command_t
+                    next_command_t = command_t + dt
 
-                    image_start = time.monotonic()
-                    images = _policy_images(frames, image_transport=image_transport)
-                    image_ms = _elapsed_ms(image_start)
-                    obs_ms = _elapsed_ms(obs_start)
-                    observation = {
-                        "state": state,
-                        "images": images,
-                        "prompt": args.prompt,
-                    }
-                    _log(
-                        f"step={step}: requesting action chunk "
-                        f"(horizon={args.action_horizon}, obs_ms={obs_ms:.1f}, state_ms={state_ms:.1f}, "
-                        f"camera_ms={camera_ms:.1f}, image_ms={image_ms:.1f}, "
-                        f"image_transport={image_transport})"
-                    )
-                    infer_start = time.monotonic()
-                    result = ws_policy.infer(observation)
-                    server_ms = _elapsed_ms(infer_start)
-                    server_timing = result.get("server_timing", {})
-                    server_model_ms = _optional_float(server_timing.get("infer_ms"))
-                    server_prev_total_ms = _optional_float(server_timing.get("prev_total_ms"))
-                    client_timing = result.get("client_timing", {})
-                    client_pack_ms = _optional_float(client_timing.get("pack_ms"))
-                    client_send_ms = _optional_float(client_timing.get("send_ms"))
-                    client_recv_wait_ms = _optional_float(client_timing.get("recv_wait_ms"))
-                    client_unpack_ms = _optional_float(client_timing.get("unpack_ms"))
-                    client_total_ms = _optional_float(client_timing.get("total_ms"))
-                    request_bytes = _optional_int(client_timing.get("request_bytes"))
-                    response_bytes = _optional_int(client_timing.get("response_bytes"))
-                    chunk_actions = np.asarray(result["actions"], dtype=np.float32)
-                    _validate_action_chunk(chunk_actions, expected_horizon=args.action_horizon)
-                    chunk_step = 0
-                    chunk_index += 1
-                    _log(
-                        f"step={step}: received chunk={chunk_index} shape={chunk_actions.shape} "
-                        f"roundtrip_ms={server_ms:.1f} server_model_ms={_format_optional_ms(server_model_ms)} "
-                        f"server_prev_total_ms={_format_optional_ms(server_prev_total_ms)} "
-                        f"client_pack_ms={_format_optional_ms(client_pack_ms)} "
-                        f"client_send_ms={_format_optional_ms(client_send_ms)} "
-                        f"client_recv_wait_ms={_format_optional_ms(client_recv_wait_ms)} "
-                        f"client_unpack_ms={_format_optional_ms(client_unpack_ms)} "
-                        f"request_bytes={_format_optional_int(request_bytes)} "
-                        f"response_bytes={_format_optional_int(response_bytes)}"
-                    )
+                    if args.execute:
+                        left, right = common.split_bimanual(command)
+                        follower_l.command_joint_pos(common.openpi_arm_state_to_i2rt(left))
+                        follower_r.command_joint_pos(common.openpi_arm_state_to_i2rt(right))
 
-                action = chunk_actions[chunk_step]
-                action_step = chunk_step
-                chunk_step += 1
+                    remaining_steps = len(chunk_actions) - chunk_step
+                    if (
+                        args.prefetch_action_chunks
+                        and pending_chunk is None
+                        and remaining_steps == prefetch_remaining_steps
+                    ):
+                        captured = _capture_policy_observation(follower_l, follower_r, cameras)
+                        _log(
+                            f"step={step}: prefetching next action chunk "
+                            f"(remaining_steps={remaining_steps}, capture_ms={captured.capture_ms:.1f}, "
+                            f"state_ms={captured.state_ms:.1f}, camera_ms={captured.camera_ms:.1f})"
+                        )
+                        pending_chunk = chunk_executor.submit(
+                            _infer_action_chunk,
+                            policy_client,
+                            captured,
+                            prompt=args.prompt,
+                            image_transport=image_transport,
+                        )
 
-                previous_command = command
-                command = common.clip_bimanual_delta(
-                    command,
-                    action,
-                    max_arm_step_rad=args.max_arm_step_rad,
-                    max_gripper_step=args.max_gripper_step,
-                )
-
-                pre_command_wait_s = next_command_t - time.monotonic()
-                if pre_command_wait_s > 0:
-                    time.sleep(pre_command_wait_s)
-                command_t = time.monotonic()
-                command_period_ms = None if last_command_t is None else 1000.0 * (command_t - last_command_t)
-                command_late_ms = max(0.0, 1000.0 * (command_t - next_command_t))
-                last_command_t = command_t
-                next_command_t = command_t + dt
-
-                if args.execute:
-                    left, right = common.split_bimanual(command)
-                    follower_l.command_joint_pos(common.openpi_arm_state_to_i2rt(left))
-                    follower_r.command_joint_pos(common.openpi_arm_state_to_i2rt(right))
-
-                loop_ms = 1000.0 * (time.monotonic() - loop_start)
-                sleep_ms = max(0.0, pre_command_wait_s) * 1000.0
-                max_delta = float(np.max(np.abs(command - previous_command)))
-                if step % max(1, args.per_step_log_interval) == 0:
-                    print(
-                        f"step={step:05d} chunk={chunk_index}:{action_step + 1}/{len(chunk_actions)} "
-                        f"source={'server' if request_new_chunk else 'cache'} "
-                        f"obs_ms={_format_optional_ms(obs_ms)} state_ms={_format_optional_ms(state_ms)} "
-                        f"camera_ms={_format_optional_ms(camera_ms)} image_ms={_format_optional_ms(image_ms)} "
-                        f"roundtrip_ms={_format_optional_ms(server_ms)} "
-                        f"server_model_ms={_format_optional_ms(server_model_ms)} "
-                        f"server_prev_total_ms={_format_optional_ms(server_prev_total_ms)} "
-                        f"client_total_ms={_format_optional_ms(client_total_ms)} "
-                        f"client_pack_ms={_format_optional_ms(client_pack_ms)} "
-                        f"client_send_ms={_format_optional_ms(client_send_ms)} "
-                        f"client_recv_wait_ms={_format_optional_ms(client_recv_wait_ms)} "
-                        f"client_unpack_ms={_format_optional_ms(client_unpack_ms)} "
-                        f"request_bytes={_format_optional_int(request_bytes)} "
-                        f"response_bytes={_format_optional_int(response_bytes)} loop_ms={loop_ms:.1f} "
-                        f"sleep_ms={sleep_ms:.1f} command_period_ms={_format_optional_ms(command_period_ms)} "
-                        f"command_late_ms={command_late_ms:.1f} "
-                        f"action_norm={float(np.linalg.norm(action)):.4f} "
-                        f"delta_norm={float(np.linalg.norm(command - previous_command)):.4f} "
-                        f"max_delta={max_delta:.4f}",
-                        flush=True,
-                    )
+                    loop_ms = 1000.0 * (time.monotonic() - loop_start)
+                    sleep_ms = max(0.0, pre_command_wait_s) * 1000.0
+                    max_delta = float(np.max(np.abs(command - previous_command)))
+                    if step % max(1, args.per_step_log_interval) == 0:
+                        print(
+                            f"step={step:05d} chunk={chunk_index}:{action_step + 1}/{len(chunk_actions)} "
+                            f"source={chunk_source if request_new_chunk else 'cache'} "
+                            f"obs_ms={_format_optional_ms(obs_ms)} state_ms={_format_optional_ms(state_ms)} "
+                            f"camera_ms={_format_optional_ms(camera_ms)} image_ms={_format_optional_ms(image_ms)} "
+                            f"roundtrip_ms={_format_optional_ms(server_ms)} "
+                            f"server_model_ms={_format_optional_ms(server_model_ms)} "
+                            f"server_prev_total_ms={_format_optional_ms(server_prev_total_ms)} "
+                            f"server_prev_active_ms={_format_optional_ms(server_prev_active_ms)} "
+                            f"client_total_ms={_format_optional_ms(client_total_ms)} "
+                            f"client_pack_ms={_format_optional_ms(client_pack_ms)} "
+                            f"client_send_ms={_format_optional_ms(client_send_ms)} "
+                            f"client_recv_wait_ms={_format_optional_ms(client_recv_wait_ms)} "
+                            f"client_unpack_ms={_format_optional_ms(client_unpack_ms)} "
+                            f"request_bytes={_format_optional_int(request_bytes)} "
+                            f"response_bytes={_format_optional_int(response_bytes)} loop_ms={loop_ms:.1f} "
+                            f"sleep_ms={sleep_ms:.1f} command_period_ms={_format_optional_ms(command_period_ms)} "
+                            f"command_late_ms={command_late_ms:.1f} "
+                            f"action_norm={float(np.linalg.norm(action)):.4f} "
+                            f"delta_norm={float(np.linalg.norm(command - previous_command)):.4f} "
+                            f"max_delta={max_delta:.4f}",
+                            flush=True,
+                        )
     finally:
+        with contextlib.suppress(Exception):
+            close = getattr(policy_client, "close", None)
+            if close is not None:
+                close()
         _log("Closing robot connections")
         for robot in robots:
             with contextlib.suppress(Exception):
                 robot.close()
         _log("Policy runner stopped")
+
+
+def _capture_policy_observation(follower_l, follower_r, cameras) -> _CapturedObservation:
+    capture_start = time.monotonic()
+    state_start = time.monotonic()
+    state = common.pack_bimanual(common.get_follower_state(follower_l), common.get_follower_state(follower_r))
+    state_ms = _elapsed_ms(state_start)
+
+    camera_start = time.monotonic()
+    frames = cameras.read()
+    camera_ms = _elapsed_ms(camera_start)
+    return _CapturedObservation(
+        state=state,
+        frames_bgr=frames,
+        capture_ms=_elapsed_ms(capture_start),
+        state_ms=state_ms,
+        camera_ms=camera_ms,
+    )
+
+
+def _infer_action_chunk(
+    policy_client,
+    captured: _CapturedObservation,
+    *,
+    prompt: str,
+    image_transport: str,
+) -> _ChunkResult:
+    image_start = time.monotonic()
+    images = _policy_images(captured.frames_bgr, image_transport=image_transport)
+    image_ms = _elapsed_ms(image_start)
+    observation = {
+        "state": captured.state,
+        "images": images,
+        "prompt": prompt,
+    }
+    infer_start = time.monotonic()
+    result = policy_client.infer(observation)
+    roundtrip_ms = _elapsed_ms(infer_start)
+    return _ChunkResult(
+        actions=np.asarray(result["actions"], dtype=np.float32),
+        capture_ms=captured.capture_ms,
+        state_ms=captured.state_ms,
+        camera_ms=captured.camera_ms,
+        image_ms=image_ms,
+        obs_ms=captured.capture_ms + image_ms,
+        roundtrip_ms=roundtrip_ms,
+        server_timing=result.get("server_timing", {}),
+        client_timing=result.get("client_timing", {}),
+    )
 
 
 def _policy_images(frames_bgr: dict[str, np.ndarray], *, image_transport: str) -> dict[str, np.ndarray | bytes]:
@@ -339,6 +446,48 @@ def _optional_int(value: Any) -> int | None:
 
 def _log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def _create_policy_client(args: Args):
+    if args.transport == "websocket":
+        policy_host = _normalize_policy_host(args.host)
+        policy_port = None if policy_host.startswith("ws") else args.port
+        return websocket_client_policy.WebsocketClientPolicy(
+            host=policy_host,
+            port=policy_port,
+            connect_timeout_s=args.connect_timeout_s,
+            retry_interval_s=args.connection_retry_interval_s,
+            response_status_interval_s=args.response_status_interval_s,
+            status_callback=_log,
+        )
+
+    if args.transport == "modal-quic":
+        return modal_quic.ModalQuicClientPolicy(
+            modal_quic.ModalQuicOptions(
+                app_name=args.modal_app_name,
+                class_name=args.modal_class_name,
+                method_name=args.modal_method_name,
+                modal_region=args.modal_region,
+                modal_gpu=args.modal_gpu,
+                server_start_timeout_s=args.modal_server_start_timeout_s,
+                punch_timeout_s=args.modal_punch_timeout_s,
+                response_status_interval_s=args.response_status_interval_s,
+                connect_retry_interval_s=args.connection_retry_interval_s,
+            ),
+            status_callback=_log,
+        )
+
+    raise ValueError(f"Unsupported transport: {args.transport}")
+
+
+def _policy_endpoint(args: Args) -> str:
+    if args.transport == "websocket":
+        policy_host = _normalize_policy_host(args.host)
+        policy_port = None if policy_host.startswith("ws") else args.port
+        return policy_host if policy_port is None else f"{policy_host}:{policy_port}"
+    if args.transport == "modal-quic":
+        return f"modal://{args.modal_app_name}/{args.modal_class_name}.{args.modal_method_name}"
+    raise ValueError(f"Unsupported transport: {args.transport}")
 
 
 def _normalize_policy_host(host: str) -> str:

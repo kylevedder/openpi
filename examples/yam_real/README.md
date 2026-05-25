@@ -170,6 +170,8 @@ modal deploy examples/yam_real/modal_app.py
 ```
 
 The `serve_policy` endpoint runs OpenPI's websocket policy server on port `8000` inside Modal.
+The same deployment also includes `YamQuicPolicyServer`, a direct Modal QUIC portal server used to bypass public
+websocket ingress during latency tests and robot playback.
 
 ## 5. Policy Playback
 
@@ -192,8 +194,24 @@ uv run python -m examples.yam_real.run_policy \
   --use-gravity-comp
 ```
 
+For the Modal QUIC path, use the deployed class directly instead of a `wss://` host:
+
+```bash
+uv run python -m examples.yam_real.run_policy \
+  --transport modal-quic \
+  --modal-app-name yam-openpi \
+  --modal-class-name YamQuicPolicyServer \
+  --prompt "pick up the object and place it in the target area" \
+  --max-steps 40 \
+  --fps 50 \
+  --action-horizon 50 \
+  --use-gravity-comp
+```
+
 By default `run_policy` uses `--image-transport auto`, which follows the policy metadata. The JPEG-trained policy
 advertises `jpeg_q85_224_rgb_v1`, so the local robot host sends compressed `224x224` images automatically.
+`run_policy` also prefetches the next action chunk by default when the current 50-step chunk has 30 steps remaining.
+Disable with `--no-prefetch-action-chunks` when debugging strictly synchronous inference timing.
 
 Run a short bounded execute with an empty workspace only after dry-run returns sane 14D actions:
 
@@ -210,11 +228,116 @@ uv run python -m examples.yam_real.run_policy \
   --execute
 ```
 
+## 6. Latency Diagnostics
+
+The latency probes are robot-safe: they do not connect to i2rt or command the arms. All probe runs write JSONL logs to:
+
+```bash
+yam_data/logs/latency/latest.jsonl
+```
+
+Local harness sanity check:
+
+```bash
+uv run python -m examples.yam_real.latency_probe_server --mode echo --port 8765
+uv run python -m examples.yam_real.latency_probe \
+  --protocol echo \
+  --host localhost \
+  --port 8765 \
+  --iterations 50 \
+  --warmup 5 \
+  --payload-bytes 115875 \
+  --response-bytes 3000 \
+  --label local_echo_jpeg_payload
+```
+
+Deploy temporary Modal diagnostic endpoints:
+
+```bash
+uv run modal deploy examples/yam_real/modal_latency_app.py
+```
+
+Then probe the public Modal ingress paths. Replace the host if Modal prints a different URL:
+
+```bash
+uv run python -m examples.yam_real.latency_probe \
+  --protocol echo \
+  --host wss://kyle-25446--yam-openpi-latency-echo-us-west.modal.run \
+  --iterations 50 \
+  --warmup 5 \
+  --payload-bytes 115875 \
+  --response-bytes 3000 \
+  --label modal_echo_us_west_jpeg_payload
+
+uv run python -m examples.yam_real.latency_probe \
+  --protocol policy \
+  --host wss://kyle-25446--yam-openpi-latency-noop-policy-us-west-108ms.modal.run \
+  --iterations 50 \
+  --warmup 5 \
+  --label modal_noop_policy_us_west_108ms
+
+uv run python -m examples.yam_real.latency_probe \
+  --protocol policy \
+  --host wss://kyle-25446--yam-openpi-serve-policy.modal.run \
+  --iterations 50 \
+  --warmup 2 \
+  --label modal_real_policy_jpeg
+```
+
+Probe the direct Modal QUIC portal paths from the same deployed diagnostic app:
+
+```bash
+uv run python -m examples.yam_real.latency_probe \
+  --transport modal-quic \
+  --protocol echo \
+  --iterations 50 \
+  --warmup 5 \
+  --payload-bytes 115875 \
+  --response-bytes 3000 \
+  --label modal_quic_echo_jpeg_payload
+
+uv run python -m examples.yam_real.latency_probe \
+  --transport modal-quic \
+  --protocol echo \
+  --iterations 50 \
+  --warmup 5 \
+  --payload-bytes 452000 \
+  --response-bytes 3000 \
+  --label modal_quic_echo_raw_equiv_payload
+
+uv run python -m examples.yam_real.latency_probe \
+  --transport modal-quic \
+  --protocol echo \
+  --modal-class-name QuicLatencyGpuServer \
+  --modal-server-start-timeout-s 300 \
+  --iterations 50 \
+  --warmup 5 \
+  --payload-bytes 115875 \
+  --response-bytes 3000 \
+  --label modal_quic_gpu_echo_jpeg_payload
+
+uv run python -m examples.yam_real.latency_probe \
+  --transport modal-quic \
+  --protocol policy \
+  --sleep-ms 108 \
+  --iterations 50 \
+  --warmup 5 \
+  --label modal_quic_noop_policy_108ms
+```
+
+The decision rule is simple: if Modal echo is already above roughly `150 ms`, the public Modal ingress path is the
+latency bottleneck. If public Modal websocket echo is slow but Modal QUIC echo is near `40 ms`, use `--transport
+modal-quic` for robot inference. If both Modal paths are slow, keep Modal for training and serve robot inference on a
+direct GPU host.
+
 Then run the task with the normal per-step limits:
 
 ```bash
 uv run python -m examples.yam_real.run_policy \
-  --host wss://<modal-endpoint-host> \
+  --transport modal-quic \
+  --modal-app-name yam-openpi \
+  --modal-class-name YamQuicPolicyServer \
+  --modal-server-start-timeout-s 1200 \
   --prompt "pick up the object and place it in the target area" \
   --max-steps 200 \
   --fps 50 \

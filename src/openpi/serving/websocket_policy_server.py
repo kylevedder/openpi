@@ -52,30 +52,37 @@ class WebsocketPolicyServer:
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None
+        prev_handler_active_time = None
         prev_response_send_time = None
         prev_response_bytes = None
         while True:
             try:
-                start_time = time.monotonic()
+                wait_start_time = time.monotonic()
                 request = await websocket.recv()
-                request_recv_wait_time = time.monotonic() - start_time
+                request_received_time = time.monotonic()
+                request_recv_wait_time = request_received_time - wait_start_time
                 request_unpack_start = time.monotonic()
                 obs = msgpack_numpy.unpackb(request)
                 request_unpack_time = time.monotonic() - request_unpack_start
 
-                infer_time = time.monotonic()
+                infer_start_time = time.monotonic()
                 action = self._policy.infer(obs)
-                infer_time = time.monotonic() - infer_time
+                infer_time = time.monotonic() - infer_start_time
 
                 action["server_timing"] = {
+                    # Legacy name kept for existing clients. This is server idle time waiting for the next request,
+                    # not one-way network receive latency.
                     "request_recv_wait_ms": request_recv_wait_time * 1000,
+                    "server_waiting_for_request_ms": request_recv_wait_time * 1000,
                     "request_bytes": len(request),
                     "request_unpack_ms": request_unpack_time * 1000,
                     "infer_ms": infer_time * 1000,
+                    "policy_infer_ms": infer_time * 1000,
                 }
                 if prev_total_time is not None:
                     # We can only record the last total time since we also want to include the send time.
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
+                    action["server_timing"]["prev_handler_active_ms"] = prev_handler_active_time * 1000
                     action["server_timing"]["prev_response_send_ms"] = prev_response_send_time * 1000
                     action["server_timing"]["prev_response_bytes"] = prev_response_bytes
 
@@ -90,7 +97,8 @@ class WebsocketPolicyServer:
                 await websocket.send(response)
                 prev_response_send_time = time.monotonic() - response_send_start
                 prev_response_bytes = len(response)
-                prev_total_time = time.monotonic() - start_time
+                prev_handler_active_time = time.monotonic() - request_received_time
+                prev_total_time = time.monotonic() - wait_start_time
 
             except websockets.ConnectionClosed:
                 logger.info(f"Connection from {websocket.remote_address} closed")

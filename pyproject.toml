@@ -40,6 +40,7 @@ dependencies = [
     "polars>=1.30.0",
     "python-can==4.5.0",
     "mujoco==3.3.5",
+    "quic-portal[modal]==0.1.13",
 ]
 
 
