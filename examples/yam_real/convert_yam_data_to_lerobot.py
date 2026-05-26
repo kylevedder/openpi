@@ -4,6 +4,7 @@ import contextlib
 import ctypes
 import dataclasses
 import gc
+import json
 from pathlib import Path
 import shutil
 from typing import Literal
@@ -65,7 +66,9 @@ def main(args: Args) -> None:
 
     first_episode = data_regression.load_canonical_episode(episode_dirs[0], source_format=args.raw_format)
     fps = round(float(first_episode.fps))
-    frame_counts = [_validate_episode(episode_dir, args) for episode_dir in episode_dirs]
+    validation_records = [_validate_episode(episode_dir, args) for episode_dir in episode_dirs]
+    validation_record_by_path = {record["source_path"]: record for record in validation_records}
+    frame_counts = [int(record["rows"]) for record in validation_records]
     print(f"Selected {len(episode_dirs)} YAM episodes")
     print(f"Total frames: {sum(frame_counts)}")
 
@@ -95,12 +98,19 @@ def main(args: Args) -> None:
             image_writer_threads=args.image_writer_threads,
         )
 
+    summary_path = output_path / "conversion_summary.jsonl"
+    if not args.resume and summary_path.exists():
+        summary_path.unlink()
+
     for episode_dir in tqdm.tqdm(episode_dirs, desc="Converting YAM episodes"):
         task, states, actions, images_or_paths = _load_episode_for_conversion(episode_dir, args.raw_format)
         if states.shape != actions.shape or states.shape[-1] != 14:
             raise RuntimeError(f"Bad state/action shapes in {episode_dir}: {states.shape}, {actions.shape}")
         if isinstance(images_or_paths, dict):
-            for camera_name, images in images_or_paths.items():
+            for camera_name in common.CAMERA_NAMES:
+                if camera_name not in images_or_paths:
+                    raise RuntimeError(f"Missing images for {camera_name} in {episode_dir}")
+                images = images_or_paths[camera_name]
                 if len(images) != len(states):
                     raise RuntimeError(
                         f"Image count mismatch for {camera_name} in {episode_dir}: {len(images)} vs {len(states)}"
@@ -119,6 +129,7 @@ def main(args: Args) -> None:
             if args.image_writer_flush_interval_frames and (idx + 1) % args.image_writer_flush_interval_frames == 0:
                 dataset._wait_image_writer()  # noqa: SLF001
         dataset.save_episode()
+        _append_conversion_summary(summary_path, validation_record_by_path[str(episode_dir)])
         del states, actions, images_or_paths
         gc.collect()
         _malloc_trim()
@@ -163,12 +174,14 @@ def _episode_dirs(raw_dir: Path, episode_manifest: Path | None, raw_format: str)
     return episode_dirs
 
 
-def _validate_episode(episode_dir: Path, args: Args) -> int:
+def _validate_episode(episode_dir: Path, args: Args) -> dict:
     episode = data_regression.load_canonical_episode(episode_dir, source_format=args.raw_format)
     states = episode.state
     actions = episode.action
     if states.shape != actions.shape or states.shape[-1] != 14:
         raise RuntimeError(f"Bad state/action shapes in {episode_dir}: {states.shape}, {actions.shape}")
+    if episode.fps <= 0:
+        raise RuntimeError(f"Bad row fps in {episode_dir}: {episode.fps}")
     for camera_name in common.CAMERA_NAMES:
         if episode.image_counts.get(camera_name, 0) != len(states):
             raise RuntimeError(
@@ -187,7 +200,15 @@ def _validate_episode(episode_dir: Path, args: Args) -> int:
             f"Timing mismatch in {episode_dir}: {detail}. "
             "Fix collection FPS or pass --allow-timing-mismatch for an explicit one-off conversion."
         )
-    return int(states.shape[0])
+    fatal_warnings = [
+        warning
+        for warning in summary["warnings"]
+        if "contains non-finite" in warning or "gripper values outside [0, 1]" in warning
+    ]
+    if fatal_warnings:
+        detail = "; ".join(fatal_warnings)
+        raise RuntimeError(f"Invalid values in {episode_dir}: {detail}")
+    return _conversion_summary_record(episode, summary)
 
 
 def _load_episode_for_conversion(episode_dir: Path, raw_format: str) -> tuple[str, np.ndarray, np.ndarray, object]:
@@ -206,6 +227,7 @@ def _load_episode_for_conversion(episode_dir: Path, raw_format: str) -> tuple[st
         episode = mcap_episode.read_episode(episode_dir, decode_images=True)
         if episode.images is None:
             raise RuntimeError(f"MCAP episode did not decode images: {episode_dir}")
+        _validate_image_arrays(episode_dir, episode.images, rows=len(episode.state))
         return (
             episode.task,
             np.asarray(episode.state, dtype=np.float32),
@@ -248,7 +270,49 @@ def _load_chw_rgb(path: Path) -> np.ndarray:
 
 
 def _hwc_rgb_to_chw(image: np.ndarray) -> np.ndarray:
+    image = np.asarray(image)
+    if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
+        raise RuntimeError(f"Expected HWC uint8 RGB image, got shape={image.shape}, dtype={image.dtype}")
     return np.transpose(image, (2, 0, 1))
+
+
+def _validate_image_arrays(episode_dir: Path, images: dict[str, np.ndarray], *, rows: int) -> None:
+    for camera_name in common.CAMERA_NAMES:
+        if camera_name not in images:
+            raise RuntimeError(f"MCAP episode {episode_dir} is missing decoded images for {camera_name}")
+        camera_images = np.asarray(images[camera_name])
+        if camera_images.shape[:1] != (rows,):
+            raise RuntimeError(
+                f"MCAP image row count mismatch for {camera_name} in {episode_dir}: "
+                f"{camera_images.shape[:1]} vs {(rows,)}"
+            )
+        if camera_images.dtype != np.uint8 or camera_images.ndim != 4 or camera_images.shape[-1] != 3:
+            raise RuntimeError(
+                f"MCAP images for {camera_name} in {episode_dir} must be NHWC uint8 RGB, "
+                f"got shape={camera_images.shape}, dtype={camera_images.dtype}"
+            )
+
+
+def _conversion_summary_record(episode: data_regression.CanonicalEpisode, summary: dict) -> dict:
+    return {
+        "source_path": str(episode.source_path),
+        "source_format": episode.source_format,
+        "task": episode.task,
+        "rows": episode.num_frames,
+        "row_fps": episode.row_fps or episode.fps,
+        "camera_fps": {
+            camera_name: camera_summary.get("median_fps", 0.0)
+            for camera_name, camera_summary in summary.get("camera_timing", {}).items()
+        },
+        "camera_frame_reuse": episode.camera_frame_reuse,
+        "warnings": summary["warnings"],
+    }
+
+
+def _append_conversion_summary(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as file:
+        file.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

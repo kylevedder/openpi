@@ -292,6 +292,7 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
     arrays_by_sequence: dict[pistream_mcap.FieldKey, dict[int, np.ndarray]] = {
         field: {} for field in _required_state_action_fields()
     }
+    camera_sequences: dict[str, set[int]] = {camera_name: set() for camera_name in CAMERA_FIELD_MAP}
     images_by_sequence: dict[str, dict[int, np.ndarray]] = {camera_name: {} for camera_name in CAMERA_FIELD_MAP}
     video_pending_sequences: dict[str, deque[tuple[int, int]]] = {
         camera_name: deque() for camera_name in CAMERA_FIELD_MAP
@@ -333,15 +334,33 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
             video_frame = frame_pb2.VideoFrame()
             video_frame.ParseFromString(message.data)
             camera_name = _camera_name_for_field(field)
+            camera_sequences[camera_name].add(message.sequence)
             if decode_images:
                 video_pending_sequences[camera_name].append((message.sequence, message.log_time))
-                for image in decoders[camera_name].decode_to_rgb(video_frame):
+                try:
+                    decoded_images = decoders[camera_name].decode_to_rgb(video_frame)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to decode {camera_name} video sequence {message.sequence} in {episode_dir}"
+                    ) from exc
+                for image in decoded_images:
                     sequence_id, _timestamp_ns = video_pending_sequences[camera_name].popleft()
+                    _validate_rgb_image(image, episode_dir, camera_name, sequence_id)
                     images_by_sequence[camera_name][sequence_id] = image
     if decode_images:
-        _finalize_video_decoders(decoders, pending_sequences=video_pending_sequences, images=images_by_sequence)
+        _finalize_video_decoders(
+            decoders,
+            episode_dir=episode_dir,
+            pending_sequences=video_pending_sequences,
+            images=images_by_sequence,
+        )
 
-    snapshots = _validate_snapshots(episode_dir, snapshots=snapshots, arrays=arrays_by_sequence)
+    snapshots = _validate_snapshots(
+        episode_dir,
+        snapshots=snapshots,
+        arrays=arrays_by_sequence,
+        camera_sequences=camera_sequences,
+    )
     state = []
     action = []
     images_by_row: dict[str, list[np.ndarray]] = {camera_name: [] for camera_name in CAMERA_FIELD_MAP}
@@ -387,12 +406,15 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
         camera_name: np.asarray(_unique_preserve_order(values), dtype=np.int64)
         for camera_name, values in camera_row_timestamps.items()
     }
+    state_array = np.asarray(state, dtype=np.float32)
+    action_array = np.asarray(action, dtype=np.float32)
+    _validate_episode_arrays(episode_dir, state_array, action_array)
     return YamMcapEpisode(
         task=metadata.get("task", ""),
         fps=_fps_from_metadata_or_timestamps(metadata, timestamps_ns),
         timestamps_ns=timestamps_ns,
-        state=np.asarray(state, dtype=np.float32),
-        action=np.asarray(action, dtype=np.float32),
+        state=state_array,
+        action=action_array,
         images=image_arrays,
         camera_timestamps_ns=camera_timestamps_ns,
         camera_frame_reuse={
@@ -578,6 +600,7 @@ def _validate_snapshots(
     *,
     snapshots: list[tuple[int, dict[pistream_mcap.FieldKey, FieldValueRef]]],
     arrays: dict[pistream_mcap.FieldKey, dict[int, np.ndarray]],
+    camera_sequences: dict[str, set[int]],
 ) -> list[tuple[int, dict[pistream_mcap.FieldKey, FieldValueRef]]]:
     if not snapshots:
         raise RuntimeError(f"No action_snapshot rows found in MCAP episode {episode_dir}")
@@ -588,6 +611,13 @@ def _validate_snapshots(
         if missing_refs:
             names = [f"{field.publisher_id}/{field.key}" for field in missing_refs]
             raise RuntimeError(f"MCAP episode {episode_dir} row {row_index} is missing snapshot refs: {names}")
+        for camera_name, field in CAMERA_FIELD_MAP.items():
+            ref = refs[field]
+            if ref.sequence_id not in camera_sequences[camera_name]:
+                raise RuntimeError(
+                    f"MCAP episode {episode_dir} row {row_index} references missing "
+                    f"{camera_name} video sequence {ref.sequence_id}"
+                )
         for field in _required_state_action_fields():
             ref = refs[field]
             if ref.sequence_id not in arrays[field]:
@@ -596,6 +626,23 @@ def _validate_snapshots(
                     f"{field.publisher_id}/{field.key} sequence {ref.sequence_id}"
                 )
     return snapshots
+
+
+def _validate_episode_arrays(episode_dir: Path, state: np.ndarray, action: np.ndarray) -> None:
+    if state.ndim != 2 or action.ndim != 2 or state.shape != action.shape or state.shape[-1] != 14:
+        raise RuntimeError(f"MCAP episode {episode_dir} has bad state/action shapes: {state.shape}, {action.shape}")
+    if not np.all(np.isfinite(state)):
+        raise RuntimeError(f"MCAP episode {episode_dir} state contains non-finite values")
+    if not np.all(np.isfinite(action)):
+        raise RuntimeError(f"MCAP episode {episode_dir} action contains non-finite values")
+
+
+def _validate_rgb_image(image: np.ndarray, episode_dir: Path, camera_name: str, sequence_id: int) -> None:
+    if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
+        raise RuntimeError(
+            f"MCAP episode {episode_dir} decoded bad RGB image for {camera_name} sequence {sequence_id}: "
+            f"shape={image.shape}, dtype={image.dtype}"
+        )
 
 
 def _array_for_ref(
@@ -631,12 +678,22 @@ def _unique_preserve_order(values: Iterable[int]) -> list[int]:
 def _finalize_video_decoders(
     decoders: dict[str, pistream_mcap.H264VideoDecoder],
     *,
+    episode_dir: Path,
     pending_sequences: dict[str, deque[tuple[int, int]]],
     images: dict[str, dict[int, np.ndarray]],
 ) -> None:
     for camera_name, decoder in decoders.items():
-        for frame in decoder.finalize():
+        try:
+            frames = decoder.finalize()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to finalize {camera_name} video decoder") from exc
+        for frame in frames:
             if not pending_sequences[camera_name]:
                 break
             sequence_id, _timestamp_ns = pending_sequences[camera_name].popleft()
-            images[camera_name][sequence_id] = frame.to_ndarray(format="rgb24")
+            image = frame.to_ndarray(format="rgb24")
+            _validate_rgb_image(image, episode_dir, camera_name, sequence_id)
+            images[camera_name][sequence_id] = image
+        if pending_sequences[camera_name]:
+            missing = [sequence_id for sequence_id, _timestamp_ns in pending_sequences[camera_name]]
+            raise RuntimeError(f"Video decoder did not produce images for {camera_name} sequence(s): {missing}")
