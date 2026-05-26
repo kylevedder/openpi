@@ -44,24 +44,24 @@ def _channel_for(role: str, side: str, override: str | None) -> str:
     return common.LEADER_CHANNELS[side]
 
 
-def _build_motor_config(arm: str, gripper: str, role: str) -> tuple[list[tuple[int, str]], np.ndarray]:
+def build_motor_config(arm: str, gripper: str, role: str) -> tuple[list[tuple[int, str]], np.ndarray]:
     common.ensure_i2rt_importable()
-    from i2rt.robots.get_robot import _ARM_HW_CONFIGS
     from i2rt.robots.utils import ArmType
     from i2rt.robots.utils import GripperType
+    from i2rt.robots.utils import _load_arm_config
 
     arm_type = ArmType.from_string_name(arm)
     gripper_type = GripperType.from_string_name(gripper)
 
-    hw = _ARM_HW_CONFIGS[arm_type]
+    hw = _load_arm_config(arm_type)
     motor_list = [(int(can_id), str(motor_type)) for can_id, motor_type in hw.motor_list]
     directions = list(hw.directions)
 
     # Leaders use the passive teaching handle, so they only expose the 6 arm motors here.
     with_gripper = role == "follower" and gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     if with_gripper:
-        motor_list.append((0x07, gripper_type.get_motor_type()))
-        directions.append(1)
+        motor_list.append((0x07, gripper_type.get_motor_type(arm_type)))
+        directions.append(gripper_type.get_motor_direction(arm_type))
 
     return motor_list, np.asarray(directions, dtype=np.int8)
 
@@ -78,7 +78,7 @@ def read_motors(
     from i2rt.motor_drivers.dm_driver import ControlMode
     from i2rt.motor_drivers.dm_driver import DMSingleMotorCanInterface
 
-    motor_list, directions = _build_motor_config(arm=arm, gripper=gripper, role=role)
+    motor_list, directions = build_motor_config(arm=arm, gripper=gripper, role=role)
     iface = DMSingleMotorCanInterface(
         channel=channel,
         bustype="socketcan",

@@ -51,6 +51,8 @@ class Args:
     strict: bool = False
     max_arm_abs_rad: float = 3.2
     max_arm_step_rad: float = 1.25
+    max_median_dt_error_ratio: float = 0.25
+    max_p95_dt_error_ratio: float = 2.5
     min_gripper_range: float = 0.05
     open_threshold: float = 0.25
     close_threshold: float = 0.75
@@ -81,6 +83,8 @@ def main(args: Args) -> None:
             episode,
             max_arm_abs_rad=args.max_arm_abs_rad,
             max_arm_step_rad=args.max_arm_step_rad,
+            max_median_dt_error_ratio=args.max_median_dt_error_ratio,
+            max_p95_dt_error_ratio=args.max_p95_dt_error_ratio,
             min_gripper_range=args.min_gripper_range,
             open_threshold=args.open_threshold,
             close_threshold=args.close_threshold,
@@ -157,9 +161,8 @@ def discover_episodes(path: Path, *, source_format: Literal["auto", "npz", "mcap
     for child in sorted(path.iterdir()):
         if not child.is_dir():
             continue
-        if (
-            (source_format in ("auto", "npz") and (child / "episode.npz").exists())
-            or (source_format in ("auto", "mcap") and any(child.glob("episode_part*.mcap")))
+        if (source_format in ("auto", "npz") and (child / "episode.npz").exists()) or (
+            source_format in ("auto", "mcap") and any(child.glob("episode_part*.mcap"))
         ):
             episodes.append(child)
     return episodes
@@ -243,6 +246,8 @@ def summarize_episode(
     *,
     max_arm_abs_rad: float = 3.2,
     max_arm_step_rad: float = 1.25,
+    max_median_dt_error_ratio: float = 0.25,
+    max_p95_dt_error_ratio: float = 2.5,
     min_gripper_range: float = 0.05,
     open_threshold: float = 0.25,
     close_threshold: float = 0.75,
@@ -255,6 +260,7 @@ def summarize_episode(
         "fps": episode.fps,
         "num_frames": episode.num_frames,
         "duration_s": _duration_s(episode.timestamps_s),
+        "timing": _timestamp_stats(episode.timestamps_s, fps=episode.fps),
         "image_counts": episode.image_counts,
         "state_stats": _matrix_stats(episode.state),
         "action_stats": _matrix_stats(episode.action),
@@ -273,6 +279,24 @@ def summarize_episode(
 
     if episode.num_frames == 0:
         warnings.append("episode has no frames")
+    if episode.num_frames > 1 and episode.fps > 0:
+        expected_dt_s = 1.0 / episode.fps
+        timing = record["timing"]
+        median_dt_s = timing["median_dt_s"]
+        p95_dt_s = timing["p95_dt_s"]
+        median_error_ratio = abs(median_dt_s - expected_dt_s) / expected_dt_s
+        if median_error_ratio > max_median_dt_error_ratio:
+            warnings.append(
+                "timestamp median dt "
+                f"{median_dt_s:.4f}s does not match fps={episode.fps:g} "
+                f"(expected {expected_dt_s:.4f}s, error_ratio={median_error_ratio:.2f})"
+            )
+        if p95_dt_s > expected_dt_s * max_p95_dt_error_ratio:
+            warnings.append(
+                "timestamp p95 dt "
+                f"{p95_dt_s:.4f}s exceeds {max_p95_dt_error_ratio:.2f}x expected dt "
+                f"{expected_dt_s:.4f}s for fps={episode.fps:g}"
+            )
     for name, matrix in (("state", episode.state), ("action", episode.action)):
         if not np.all(np.isfinite(matrix)):
             warnings.append(f"{name} contains non-finite values")
@@ -542,6 +566,34 @@ def _duration_s(timestamps_s: np.ndarray) -> float:
     if len(timestamps_s) < 2:
         return 0.0
     return float(timestamps_s[-1] - timestamps_s[0])
+
+
+def _timestamp_stats(timestamps_s: np.ndarray, *, fps: float) -> dict[str, float | int]:
+    if len(timestamps_s) < 2:
+        expected_dt_s = 0.0 if fps <= 0 else 1.0 / fps
+        return {
+            "num_intervals": 0,
+            "expected_dt_s": expected_dt_s,
+            "median_dt_s": 0.0,
+            "mean_dt_s": 0.0,
+            "p95_dt_s": 0.0,
+            "max_dt_s": 0.0,
+            "min_dt_s": 0.0,
+            "median_fps": 0.0,
+        }
+
+    dt = np.diff(np.asarray(timestamps_s, dtype=np.float64))
+    median_dt_s = float(np.median(dt))
+    return {
+        "num_intervals": int(dt.size),
+        "expected_dt_s": 0.0 if fps <= 0 else float(1.0 / fps),
+        "median_dt_s": median_dt_s,
+        "mean_dt_s": float(np.mean(dt)),
+        "p95_dt_s": float(np.quantile(dt, 0.95)),
+        "max_dt_s": float(np.max(dt)),
+        "min_dt_s": float(np.min(dt)),
+        "median_fps": 0.0 if median_dt_s <= 0 else float(1.0 / median_dt_s),
+    }
 
 
 def _as_float_matrix(value: np.ndarray, name: str, source_path: Path) -> np.ndarray:

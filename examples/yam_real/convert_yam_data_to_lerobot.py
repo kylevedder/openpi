@@ -32,6 +32,9 @@ class Args:
     image_writer_flush_interval_frames: int = 0
     push_to_hub: bool = False
     overwrite: bool = True
+    allow_timing_mismatch: bool = False
+    max_median_dt_error_ratio: float = 0.25
+    max_p95_dt_error_ratio: float = 2.5
 
 
 def main(args: Args) -> None:
@@ -62,7 +65,7 @@ def main(args: Args) -> None:
 
     first_episode = data_regression.load_canonical_episode(episode_dirs[0], source_format=args.raw_format)
     fps = round(float(first_episode.fps))
-    frame_counts = [_validate_episode(episode_dir, args.raw_format) for episode_dir in episode_dirs]
+    frame_counts = [_validate_episode(episode_dir, args) for episode_dir in episode_dirs]
     print(f"Selected {len(episode_dirs)} YAM episodes")
     print(f"Total frames: {sum(frame_counts)}")
 
@@ -160,8 +163,8 @@ def _episode_dirs(raw_dir: Path, episode_manifest: Path | None, raw_format: str)
     return episode_dirs
 
 
-def _validate_episode(episode_dir: Path, raw_format: str) -> int:
-    episode = data_regression.load_canonical_episode(episode_dir, source_format=raw_format)
+def _validate_episode(episode_dir: Path, args: Args) -> int:
+    episode = data_regression.load_canonical_episode(episode_dir, source_format=args.raw_format)
     states = episode.state
     actions = episode.action
     if states.shape != actions.shape or states.shape[-1] != 14:
@@ -172,6 +175,18 @@ def _validate_episode(episode_dir: Path, raw_format: str) -> int:
                 f"Image count mismatch for {camera_name} in {episode_dir}: "
                 f"{episode.image_counts.get(camera_name, 0)} vs {len(states)}"
             )
+    summary = data_regression.summarize_episode(
+        episode,
+        max_median_dt_error_ratio=args.max_median_dt_error_ratio,
+        max_p95_dt_error_ratio=args.max_p95_dt_error_ratio,
+    )
+    timing_warnings = [warning for warning in summary["warnings"] if warning.startswith("timestamp ")]
+    if timing_warnings and not args.allow_timing_mismatch:
+        detail = "; ".join(timing_warnings)
+        raise RuntimeError(
+            f"Timing mismatch in {episode_dir}: {detail}. "
+            "Fix collection FPS or pass --allow-timing-mismatch for an explicit one-off conversion."
+        )
     return int(states.shape[0])
 
 
