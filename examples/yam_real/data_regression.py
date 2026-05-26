@@ -13,7 +13,9 @@ import tyro
 from examples.yam_real import common
 
 GRIPPER_DIMS = (6, 13)
+ARM_DIMS = tuple(dim for dim in range(14) if dim not in GRIPPER_DIMS)
 CAMERA_NAMES = common.CAMERA_NAMES
+DIM_NAMES = common.STATE_ORDER
 DEFAULT_OLD_GOOD_DIR = Path("yam_data/archive/raw_before_moved_robot_20260525_145623")
 DEFAULT_CURRENT_RAW_DIR = Path("yam_data/raw")
 DEFAULT_LOG_DIR = Path("yam_data/logs/data_regression")
@@ -47,6 +49,8 @@ class Args:
     output_dir: Path = DEFAULT_LOG_DIR
     max_episodes_per_source: int | None = None
     strict: bool = False
+    max_arm_abs_rad: float = 3.2
+    max_arm_step_rad: float = 1.25
     min_gripper_range: float = 0.05
     open_threshold: float = 0.25
     close_threshold: float = 0.75
@@ -75,6 +79,8 @@ def main(args: Args) -> None:
         )
         record = summarize_episode(
             episode,
+            max_arm_abs_rad=args.max_arm_abs_rad,
+            max_arm_step_rad=args.max_arm_step_rad,
             min_gripper_range=args.min_gripper_range,
             open_threshold=args.open_threshold,
             close_threshold=args.close_threshold,
@@ -235,6 +241,8 @@ def load_lerobot_episode(repo_id: str, *, root: Path | None, episode_index: int)
 def summarize_episode(
     episode: CanonicalEpisode,
     *,
+    max_arm_abs_rad: float = 3.2,
+    max_arm_step_rad: float = 1.25,
     min_gripper_range: float = 0.05,
     open_threshold: float = 0.25,
     close_threshold: float = 0.75,
@@ -250,6 +258,12 @@ def summarize_episode(
         "image_counts": episode.image_counts,
         "state_stats": _matrix_stats(episode.state),
         "action_stats": _matrix_stats(episode.action),
+        "state_stats_by_name": _named_matrix_stats(episode.state),
+        "action_stats_by_name": _named_matrix_stats(episode.action),
+        "arm_joints": {
+            "state": _arm_joint_stats(episode.state),
+            "action": _arm_joint_stats(episode.action),
+        },
         "gripper": {
             "state": _gripper_stats(episode.state, open_threshold=open_threshold, close_threshold=close_threshold),
             "action": _gripper_stats(episode.action, open_threshold=open_threshold, close_threshold=close_threshold),
@@ -266,6 +280,15 @@ def summarize_episode(
         out_of_range = np.logical_or(grippers < -1e-4, grippers > 1.0001)
         if np.any(out_of_range):
             warnings.append(f"{name} gripper values outside [0, 1]: {int(np.count_nonzero(out_of_range))}")
+
+        arm_values = matrix[:, ARM_DIMS]
+        arm_abs_max = float(np.max(np.abs(arm_values))) if arm_values.size else 0.0
+        if arm_abs_max > max_arm_abs_rad:
+            warnings.append(f"{name} arm joint abs max {arm_abs_max:.4f} exceeds {max_arm_abs_rad:.4f} rad")
+
+        arm_step_max = _max_abs_step(arm_values)
+        if arm_step_max > max_arm_step_rad:
+            warnings.append(f"{name} arm joint step max {arm_step_max:.4f} exceeds {max_arm_step_rad:.4f} rad")
 
     for key, side in (("left", 0), ("right", 1)):
         values = episode.action[:, GRIPPER_DIMS[side]]
@@ -308,10 +331,12 @@ def make_synthetic_episode(num_frames: int = 6) -> CanonicalEpisode:
         raise ValueError("Synthetic YAM regression episode needs at least four frames.")
     state = np.zeros((num_frames, 14), dtype=np.float32)
     action = np.zeros((num_frames, 14), dtype=np.float32)
+    left_arm = np.linspace(-0.5, 0.5, 6, dtype=np.float32)
+    right_arm = np.linspace(0.4, -0.4, 6, dtype=np.float32)
     for idx in range(num_frames):
         base = np.float32(idx / 100.0)
-        state[idx, :6] = base + np.arange(6, dtype=np.float32)
-        state[idx, 7:13] = -base - np.arange(6, dtype=np.float32)
+        state[idx, :6] = base + left_arm
+        state[idx, 7:13] = -base + right_arm
         action[idx, :6] = state[idx, :6] + 0.01
         action[idx, 7:13] = state[idx, 7:13] - 0.01
 
@@ -476,6 +501,41 @@ def _matrix_stats(matrix: np.ndarray) -> dict[str, list[float]]:
         "mean": np.mean(matrix, axis=0).astype(float).tolist(),
         "std": np.std(matrix, axis=0).astype(float).tolist(),
     }
+
+
+def _named_matrix_stats(matrix: np.ndarray) -> dict[str, dict[str, float]]:
+    stats = _matrix_stats(matrix)
+    if not stats["min"]:
+        return {}
+    return {
+        name: {
+            "min": stats["min"][dim],
+            "max": stats["max"][dim],
+            "mean": stats["mean"][dim],
+            "std": stats["std"][dim],
+        }
+        for dim, name in enumerate(DIM_NAMES)
+    }
+
+
+def _arm_joint_stats(matrix: np.ndarray) -> dict[str, float]:
+    if matrix.size == 0:
+        return {"min": 0.0, "max": 0.0, "abs_max": 0.0, "step_abs_max": 0.0, "step_abs_p99": 0.0}
+    arm_values = matrix[:, ARM_DIMS]
+    diffs = np.abs(np.diff(arm_values, axis=0)) if len(arm_values) > 1 else np.zeros((0, len(ARM_DIMS)))
+    return {
+        "min": float(np.min(arm_values)),
+        "max": float(np.max(arm_values)),
+        "abs_max": float(np.max(np.abs(arm_values))),
+        "step_abs_max": float(np.max(diffs)) if diffs.size else 0.0,
+        "step_abs_p99": float(np.quantile(diffs, 0.99)) if diffs.size else 0.0,
+    }
+
+
+def _max_abs_step(values: np.ndarray) -> float:
+    if len(values) < 2:
+        return 0.0
+    return float(np.max(np.abs(np.diff(values, axis=0))))
 
 
 def _duration_s(timestamps_s: np.ndarray) -> float:

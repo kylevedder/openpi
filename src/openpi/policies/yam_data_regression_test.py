@@ -48,6 +48,8 @@ def test_synthetic_npz_canonical_round_trip(tmp_path: Path) -> None:
     assert summary["warnings"] == []
     assert summary["gripper"]["action"]["left_gripper"]["close_count"] > 0
     assert summary["gripper"]["action"]["right_gripper"]["open_count"] > 0
+    assert summary["arm_joints"]["action"]["abs_max"] > 0
+    assert "left_waist" in summary["action_stats_by_name"]
 
 
 def test_synthetic_mcap_canonical_round_trip(tmp_path: Path) -> None:
@@ -136,6 +138,14 @@ def test_yam_training_data_config_preserves_absolute_gripper_targets() -> None:
         transformed["actions"][:, data_regression.GRIPPER_DIMS],
         episode.action[:4, data_regression.GRIPPER_DIMS],
     )
+    np.testing.assert_allclose(
+        transformed["actions"][:, :6],
+        episode.action[:4, :6] - episode.state[0, :6],
+    )
+    np.testing.assert_allclose(
+        transformed["actions"][:, 7:13],
+        episode.action[:4, 7:13] - episode.state[0, 7:13],
+    )
 
     stats = normalize.RunningStats()
     stats.update(transformed["actions"])
@@ -143,3 +153,24 @@ def test_yam_training_data_config_preserves_absolute_gripper_targets() -> None:
     gripper_dims = list(data_regression.GRIPPER_DIMS)
     assert np.all(np.isfinite(action_stats.mean[gripper_dims]))
     assert np.all(action_stats.std[gripper_dims] > 0)
+
+
+def test_joint_regression_warns_on_large_arm_jump() -> None:
+    episode = data_regression.make_synthetic_episode()
+    action = episode.action.copy()
+    action[2, 0] += 10.0
+    bad_episode = data_regression.CanonicalEpisode(
+        source_path=episode.source_path,
+        source_format=episode.source_format,
+        task=episode.task,
+        fps=episode.fps,
+        state=episode.state,
+        action=action,
+        timestamps_s=episode.timestamps_s,
+        image_counts=episode.image_counts,
+    )
+
+    summary = data_regression.summarize_episode(bad_episode)
+
+    assert any("action arm joint abs max" in warning for warning in summary["warnings"])
+    assert any("action arm joint step max" in warning for warning in summary["warnings"])
