@@ -9,6 +9,19 @@ sys.path.append(str(Path(__file__).resolve().parents[3]))
 
 from examples.yam_real import common
 from examples.yam_real import data_regression
+from examples.yam_real import record_episode
+
+
+def test_record_episode_defaults_match_standard_mcap_record_command() -> None:
+    args = record_episode.Args()
+
+    assert args.output_dir == Path("yam_data/raw")
+    assert args.fps == 50.0
+    assert args.camera_fps == 30.0
+    assert args.camera_width == 640
+    assert args.camera_height == 480
+    assert args.camera_pixel_format == "MJPG"
+    assert args.use_gravity_comp is True
 
 
 def test_linuxpy_camera_rejects_unsupported_50hz_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -41,6 +54,18 @@ def test_linuxpy_camera_sets_mjpg_mode_and_returns_rgb(monkeypatch: pytest.Monke
     np.testing.assert_allclose(frame.frame[0, 0], np.asarray([0, 20, 40], dtype=np.uint8), atol=1)
 
 
+def test_linuxpy_camera_accepts_method_frame_sizes_with_fps_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_env = FakeCameraEnv(max_fps=30.0, linuxpy_024_info=True)
+    fake_env.install(monkeypatch)
+
+    config = common.CameraConfig(frame_size=(640, 480), fps=30, pixel_format="MJPG", verify_mode=True)
+    with common.LinuxpyV4L2Camera("cam_high", "/dev/fake", config) as camera:
+        frame = camera.read()
+
+    assert frame.frame.shape == (480, 640, 3)
+    assert fake_env.captures[0].format_call == (640, 480, "MJPG")
+
+
 def test_async_camera_set_returns_latest_frame_without_waiting_for_next_read(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_env = FakeCameraEnv(max_fps=30.0, read_delay_s=0.03)
     fake_env.install(monkeypatch)
@@ -70,9 +95,10 @@ def test_camera_metadata_counts_unique_frames_and_reused_rows() -> None:
 
 
 class FakeCameraEnv:
-    def __init__(self, *, max_fps: float, read_delay_s: float = 0.0) -> None:
+    def __init__(self, *, max_fps: float, read_delay_s: float = 0.0, linuxpy_024_info: bool = False) -> None:
         self.max_fps = max_fps
         self.read_delay_s = read_delay_s
+        self.linuxpy_024_info = linuxpy_024_info
         self.devices: list[FakeDevice] = []
         self.captures: list[FakeVideoCapture] = []
 
@@ -81,7 +107,12 @@ class FakeCameraEnv:
 
         class DeviceFactory(FakeDevice):
             def __init__(self, path: str) -> None:
-                super().__init__(path, max_fps=env.max_fps, read_delay_s=env.read_delay_s)
+                super().__init__(
+                    path,
+                    max_fps=env.max_fps,
+                    read_delay_s=env.read_delay_s,
+                    linuxpy_024_info=env.linuxpy_024_info,
+                )
                 env.devices.append(self)
 
         class VideoCaptureFactory(FakeVideoCapture):
@@ -111,6 +142,43 @@ class FakeInfo:
         self.frame_sizes = [FakeFrameSize(max_fps)]
 
 
+class FakeSize:
+    width = 640
+    height = 480
+
+
+class FakeLinuxpy024FrameSize:
+    pixel_format = common.video_device.PixelFormat.MJPEG
+    info = FakeSize()
+
+
+class FakeFrameInterval:
+    pixel_format = common.video_device.PixelFormat.MJPEG
+    width = 640
+    height = 480
+    min_fps = 1.0
+
+    def __init__(self, max_fps: float) -> None:
+        self.max_fps = max_fps
+
+
+class FakeLinuxpy024Info:
+    bus_info = "usb-fake"
+    card = "FakeCam"
+    driver = "fake"
+
+    def __init__(self, max_fps: float) -> None:
+        self.max_fps = max_fps
+
+    def frame_sizes(self) -> list[FakeLinuxpy024FrameSize]:
+        return [FakeLinuxpy024FrameSize()]
+
+    def fps_intervals(self, pixel_format, width: int, height: int) -> list[FakeFrameInterval]:
+        assert pixel_format == common.video_device.PixelFormat.MJPEG
+        assert (width, height) == (640, 480)
+        return [FakeFrameInterval(self.max_fps)]
+
+
 class FakeFrame:
     pixel_format = common.video_device.PixelFormat.MJPEG
 
@@ -124,9 +192,9 @@ class FakeFrame:
 
 
 class FakeDevice:
-    def __init__(self, path: str, *, max_fps: float, read_delay_s: float) -> None:
+    def __init__(self, path: str, *, max_fps: float, read_delay_s: float, linuxpy_024_info: bool) -> None:
         self.path = path
-        self.info = FakeInfo(max_fps)
+        self.info = FakeLinuxpy024Info(max_fps) if linuxpy_024_info else FakeInfo(max_fps)
         self.read_delay_s = read_delay_s
         self.opened = False
         self.closed = False

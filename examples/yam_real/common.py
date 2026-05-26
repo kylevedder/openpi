@@ -455,7 +455,7 @@ class AsyncCameraSet:
 def camera_capabilities(device: video_device.Device) -> dict[str, Any]:
     info = device.info
     return {
-        "frame_sizes": _frame_sizes_as_dicts(getattr(info, "frame_sizes", ())),
+        "frame_sizes": _frame_sizes_as_dicts(info),
         "bus_info": getattr(info, "bus_info", ""),
         "card": getattr(info, "card", ""),
         "driver": getattr(info, "driver", ""),
@@ -470,6 +470,7 @@ def camera_mode_issues(properties: dict[str, Any], config: CameraConfig) -> list
         for frame_size in frame_sizes
         if frame_size.get("width") == config.width
         and frame_size.get("height") == config.height
+        and _pixel_formats_match(frame_size.get("pixel_format", ""), config.pixel_format)
         and float(frame_size.get("min_fps", 0.0)) <= float(config.fps)
         and float(config.fps) <= float(frame_size.get("max_fps", float("inf")))
     ]
@@ -518,17 +519,77 @@ def _apply_image_transform(image: np.ndarray, config: CameraConfig) -> np.ndarra
     return image
 
 
-def _frame_sizes_as_dicts(frame_sizes: Any) -> list[dict[str, Any]]:
-    return [
-        {
-            "width": int(getattr(frame_size, "width", 0)),
-            "height": int(getattr(frame_size, "height", 0)),
-            "min_fps": float(getattr(frame_size, "min_fps", 0.0)),
-            "max_fps": float(getattr(frame_size, "max_fps", 0.0)),
-            "pixel_format": str(getattr(frame_size, "pixel_format", "")),
-        }
-        for frame_size in frame_sizes or ()
-    ]
+def _frame_sizes_as_dicts(info: Any) -> list[dict[str, Any]]:
+    frame_sizes = getattr(info, "frame_sizes", ())
+    if callable(frame_sizes):
+        frame_sizes = frame_sizes()
+
+    result = []
+    for frame_size in frame_sizes or ():
+        width = _frame_size_attr(frame_size, "width")
+        height = _frame_size_attr(frame_size, "height")
+        pixel_format = getattr(frame_size, "pixel_format", "")
+        intervals = _fps_intervals(info, pixel_format, width, height)
+        if intervals:
+            result.extend(
+                [
+                    {
+                        "width": int(getattr(interval, "width", width)),
+                        "height": int(getattr(interval, "height", height)),
+                        "min_fps": float(getattr(interval, "min_fps", 0.0)),
+                        "max_fps": float(getattr(interval, "max_fps", 0.0)),
+                        "pixel_format": _pixel_format_label(getattr(interval, "pixel_format", pixel_format)),
+                    }
+                    for interval in intervals
+                ]
+            )
+        else:
+            result.append(
+                {
+                    "width": int(width),
+                    "height": int(height),
+                    "min_fps": float(getattr(frame_size, "min_fps", 0.0)),
+                    "max_fps": float(getattr(frame_size, "max_fps", 0.0)),
+                    "pixel_format": _pixel_format_label(pixel_format),
+                }
+            )
+    return result
+
+
+def _frame_size_attr(frame_size: Any, name: str) -> int:
+    value = getattr(frame_size, name, None)
+    if value is None and hasattr(frame_size, "info"):
+        value = getattr(frame_size.info, name, None)
+    return int(value or 0)
+
+
+def _fps_intervals(info: Any, pixel_format: Any, width: int, height: int) -> list[Any]:
+    fps_intervals = getattr(info, "fps_intervals", None)
+    if fps_intervals is None or not pixel_format or not width or not height:
+        return []
+    with contextlib.suppress(Exception):
+        return list(fps_intervals(pixel_format, width, height))
+    return []
+
+
+def _pixel_format_label(pixel_format: Any) -> str:
+    human_str = getattr(pixel_format, "human_str", None)
+    if callable(human_str):
+        with contextlib.suppress(Exception):
+            return str(human_str())
+    name = getattr(pixel_format, "name", "")
+    if name:
+        return str(name)
+    return str(pixel_format)
+
+
+def _pixel_formats_match(actual: Any, requested: str) -> bool:
+    actual_normalized = str(actual).upper()
+    if not actual_normalized:
+        return True
+    requested_normalized = requested.upper()
+    aliases = {"MJPG": {"MJPG", "MJPEG"}, "MJPEG": {"MJPG", "MJPEG"}}
+    return actual_normalized in aliases.get(requested_normalized, {requested_normalized})
 
 
 def _object_public_attrs(value: Any) -> dict[str, Any]:

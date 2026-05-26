@@ -37,7 +37,7 @@ class Args:
     gripper: Literal["crank_4310", "linear_3507", "linear_4310"] = "linear_4310"
     bilateral_kp: float = 0.2
     ee_mass: float | None = None
-    use_gravity_comp: bool = False
+    use_gravity_comp: bool = True
     status_haptic_cue: bool = True
     status_cue_gain: float = 0.08
     record_button_debounce_s: float = 1.0

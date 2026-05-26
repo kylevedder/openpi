@@ -39,20 +39,20 @@ uv run python -m examples.yam_real.read_yam_encoders --role follower --side both
 The shoulder check labels motor id `2`. If the arm is visibly pitched but the shoulder encoder reports near zero,
 the motor zero is wrong. If the encoder reports a large angle, software can see the tilt.
 
-The OpenPI hardware scripts default to `--no-use-gravity-comp` and hold follower arms at their current pose with PD on
-startup. Only opt into model gravity compensation with `--use-gravity-comp` after validating the sign and frame for the
-actual arm mounting.
+The recorder defaults to gravity compensation on, 50 Hz robot/action rows, and 30 Hz MJPG camera capture at 640x480.
+Disable gravity compensation for recording with `--no-use-gravity-comp` if you need to debug torque behavior.
 
 ## 1. Record One Teleop Episode
 
 Run from the `openpi` repo root:
 
 ```bash
-uv run python -m examples.yam_real.record_episode \
-  --output-dir yam_data/raw \
-  --task "pick up the object and place it in the target area" \
-  --fps 50
+uv run python -m examples.yam_real.record_episode
 ```
+
+The default command writes to `yam_data/raw`, uses the task text `perform the demonstrated bimanual task`, records
+50 Hz robot/action rows, captures 30 Hz 640x480 MJPG camera frames, and saves MCAP episodes. Override only the fields
+that intentionally differ from the standard collection setup.
 
 Controls:
 
@@ -69,11 +69,10 @@ The recorder writes:
 
 ```text
 yam_data/raw/<episode_name>/
-  manifest.json
-  episode.npz
-  images/cam_high/*.jpg
-  images/cam_left_wrist/*.jpg
-  images/cam_right_wrist/*.jpg
+  episode_part0.mcap
+  episode_part1.mcap
+  episode_part2.mcap
+  episode_part3.mcap
 ```
 
 ## 2. Replay the Recorded Actions
@@ -113,7 +112,10 @@ uv run python -m examples.yam_real.convert_yam_data_to_lerobot \
   --repo-id local/yam_bimanual
 ```
 
-The OpenPI configs `pi05_yam_bimanual_50hz` and `pi05_yam_bimanual_50hz_jpeg_q85` expect this repo id by default.
+The converter defaults to auto-detecting MCAP raw episodes and LeRobot image-frame output. It writes
+`conversion_summary.jsonl` in the dataset root with row counts, row FPS, inferred camera FPS, camera-frame reuse, and
+warnings. The OpenPI configs `pi05_yam_bimanual_50hz` and `pi05_yam_bimanual_50hz_jpeg_q85` expect this repo id by
+default.
 
 ## Image Transport
 
