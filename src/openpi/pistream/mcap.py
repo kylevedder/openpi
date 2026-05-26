@@ -119,6 +119,7 @@ def compressed_video_encoding(*, width: int, height: int, fps: float) -> encodin
                     encoding_pb2.CompressedVideoEncoding.EncoderOption(name="crf", value="19"),
                     encoding_pb2.CompressedVideoEncoding.EncoderOption(name="gop_size", value="4"),
                     encoding_pb2.CompressedVideoEncoding.EncoderOption(name="bf", value="0"),
+                    encoding_pb2.CompressedVideoEncoding.EncoderOption(name="tune", value="zerolatency"),
                 ],
             ),
         )
@@ -269,7 +270,7 @@ class H264VideoEncoder(Generic[_UserdataT]):
         self._stream.height = height
         self._stream.pix_fmt = "yuv420p"
         self._stream.gop_size = 4
-        self._stream.options = {"crf": "19", "bf": "0"}
+        self._stream.options = {"crf": "19", "bf": "0", "tune": "zerolatency"}
         self._next_pts_in = 0
         self._userdata: dict[int, _UserdataT] = {}
         self._iframe_offset = 0

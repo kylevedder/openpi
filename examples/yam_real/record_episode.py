@@ -11,6 +11,7 @@ import numpy as np
 import tyro
 
 from examples.yam_real import common
+from examples.yam_real import mcap_episode
 
 SYNC_BUTTON_INDEX = 0
 RECORD_BUTTON_INDEX = 1
@@ -25,6 +26,13 @@ class Args:
     episode_name: str | None = None
     task: str = "perform the demonstrated bimanual task"
     fps: float = 50.0
+    camera_fps: float = 30.0
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_pixel_format: str = "MJPG"
+    camera_startup_timeout_s: float = 5.0
+    max_camera_age_s: float = 0.25
+    skip_camera_mode_verify: bool = False
     max_duration_s: float | None = None
     gripper: Literal["crank_4310", "linear_3507", "linear_4310"] = "linear_4310"
     bilateral_kp: float = 0.2
@@ -184,10 +192,7 @@ def main(args: Args) -> None:
 
     robots = []
     episode_dir: Path | None = None
-    states: list[np.ndarray] = []
-    actions: list[np.ndarray] = []
-    timestamps: list[float] = []
-    image_paths: list[dict[str, str]] = []
+    episode_writer: mcap_episode.YamMcapEpisodeWriter | None = None
     recording = False
     start_time = None
     frame_idx = 0
@@ -195,54 +200,54 @@ def main(args: Args) -> None:
     last_record_button = 0.0
     last_record_button_toggle_t = -float("inf")
     episode_index = 0
+    camera_actual_modes: dict[str, dict] = {}
+    camera_config = common.CameraConfig(
+        frame_size=(args.camera_width, args.camera_height),
+        fps=int(args.camera_fps),
+        pixel_format=args.camera_pixel_format,
+        verify_mode=not args.skip_camera_mode_verify,
+    )
 
     def reset_episode_buffers() -> None:
         nonlocal frame_idx, start_time, next_record_t
-        states.clear()
-        actions.clear()
-        timestamps.clear()
-        image_paths.clear()
         frame_idx = 0
         start_time = None
         next_record_t = time.monotonic()
 
     def save_episode() -> bool:
-        if episode_dir is None or not states:
+        nonlocal episode_writer
+        if episode_dir is None or episode_writer is None or episode_writer.num_steps == 0:
             return False
 
-        np.savez_compressed(
-            episode_dir / "episode.npz",
-            state=np.asarray(states, dtype=np.float32),
-            action=np.asarray(actions, dtype=np.float32),
-            timestamp=np.asarray(timestamps, dtype=np.float64),
-            image_paths=np.asarray(image_paths, dtype=object),
-        )
-        manifest = common.EpisodeManifest(
-            task=args.task,
-            fps=args.fps,
-            created_at=time.time(),
-            state_order=common.STATE_ORDER,
-            action_space=common.ACTION_SPACE,
-            gripper_convention=common.GRIPPER_CONVENTION,
-            camera_paths=common.CAMERA_PATHS,
-            leader_channels=common.LEADER_CHANNELS,
-            follower_channels=common.FOLLOWER_CHANNELS,
-            num_frames=len(states),
-        )
-        manifest.write(episode_dir / "manifest.json")
-        print(f"Recorded {len(states)} frames to {episode_dir}")
+        num_steps = episode_writer.num_steps
+        episode_writer.close()
+        episode_writer = None
+        print(f"Recorded {num_steps} rows to MCAP episode {episode_dir}")
         return True
 
     def start_episode() -> None:
-        nonlocal episode_dir, episode_index, recording, start_time, next_record_t
+        nonlocal episode_dir, episode_index, episode_writer, recording, start_time, next_record_t
         if recording:
             return
-        if states:
+        if episode_writer is not None and episode_writer.num_steps:
             save_episode()
             reset_episode_buffers()
 
         episode_index += 1
         episode_dir = _make_next_episode_dir(args.output_dir, args.episode_name, episode_index)
+        episode_writer = mcap_episode.YamMcapEpisodeWriter(
+            episode_dir,
+            task=args.task,
+            fps=args.fps,
+            camera_fps=args.camera_fps,
+            image_width=args.camera_width,
+            image_height=args.camera_height,
+            camera_config={
+                "requested": camera_config.as_manifest(),
+                "actual_modes": camera_actual_modes,
+                "camera_paths": common.CAMERA_PATHS,
+            },
+        )
         reset_episode_buffers()
         recording = True
         start_time = time.monotonic()
@@ -261,7 +266,7 @@ def main(args: Args) -> None:
             pair_r.emit_recording_status(recording=True, gain=args.status_cue_gain)
 
     def stop_episode() -> None:
-        nonlocal episode_dir, recording
+        nonlocal episode_dir, episode_writer, recording
         was_recording = recording
         recording = False
         if was_recording:
@@ -269,7 +274,7 @@ def main(args: Args) -> None:
             _print_recording_banner(
                 "RECORDING STOPPED",
                 [
-                    f"Frames captured: {len(states)}",
+                    f"Rows captured: {episode_writer.num_steps if episode_writer is not None else 0}",
                     "Saving episode now",
                 ],
             )
@@ -282,6 +287,10 @@ def main(args: Args) -> None:
             print("Ready for next episode.")
         elif episode_dir is not None:
             print("No frames recorded; discarding empty episode directory.")
+            if episode_writer is not None:
+                with contextlib.suppress(Exception):
+                    episode_writer.close()
+                episode_writer = None
             shutil.rmtree(episode_dir, ignore_errors=True)
 
         episode_dir = None
@@ -334,8 +343,9 @@ def main(args: Args) -> None:
         pair_r = TeleopPair("right", leader_r, follower_r, args.bilateral_kp)
 
         if args.startup_check_only:
-            with common.CameraSet() as cameras:
+            with common.CameraSet(config=camera_config) as cameras:
                 frames = cameras.read()
+                camera_properties = cameras.capture_properties()
             state_l = common.get_follower_state(follower_l)
             state_r = common.get_follower_state(follower_r)
             leader_l_state, leader_l_buttons = leader_l.get_info()
@@ -345,13 +355,18 @@ def main(args: Args) -> None:
             print(f"left leader state shape={leader_l_state.shape}, buttons={leader_l_buttons.tolist()}")
             print(f"right leader state shape={leader_r_state.shape}, buttons={leader_r_buttons.tolist()}")
             print(f"camera shapes={ {name: frame.shape for name, frame in frames.items()} }")
+            print(f"camera properties={camera_properties}")
             return
 
-        with common.CameraSet() as cameras, common.raw_mode_stdin():
+        with common.AsyncCameraSet(config=camera_config, startup_timeout_s=args.camera_startup_timeout_s) as cameras, common.raw_mode_stdin():
+            camera_actual_modes = cameras.capture_properties()
+            print("Camera capture mode: async_latest_linuxpy_v4l2")
+            print(f"Camera requested mode: {camera_config.as_manifest()}")
+            print(f"Camera actual modes: {camera_actual_modes}")
             while True:
                 key = common.read_key_nonblocking()
                 if key == "q":
-                    if recording or states:
+                    if recording or (episode_writer is not None and episode_writer.num_steps):
                         stop_episode()
                     break
                 if key == "r":
@@ -377,13 +392,15 @@ def main(args: Args) -> None:
                     should_record = False
 
                 if should_record:
-                    if episode_dir is None:
+                    if episode_dir is None or episode_writer is None:
                         raise RuntimeError("Recording is active without an episode directory.")
-                    frames = cameras.read()
-                    image_paths.append(common.save_frames(episode_dir, frame_idx, frames))
-                    states.append(common.pack_bimanual(state_l, state_r))
-                    actions.append(common.pack_bimanual(action_l, action_r))
-                    timestamps.append(time.time())
+                    snapshot = cameras.snapshot(max_age_s=args.max_camera_age_s)
+                    episode_writer.write_step(
+                        camera_snapshot=snapshot,
+                        state=common.pack_bimanual(state_l, state_r),
+                        action=common.pack_bimanual(action_l, action_r),
+                        timestamp_ns=time.time_ns(),
+                    )
                     frame_idx += 1
                     next_record_t += 1.0 / args.fps
 
@@ -398,9 +415,12 @@ def main(args: Args) -> None:
                 time.sleep(0.005)
     except KeyboardInterrupt:
         print("Interrupted; saving recorded frames before exit.")
-        if recording or states:
+        if recording or (episode_writer is not None and episode_writer.num_steps):
             stop_episode()
     finally:
+        if episode_writer is not None:
+            with contextlib.suppress(Exception):
+                episode_writer.close()
         for robot in robots:
             with contextlib.suppress(Exception):
                 robot.close()

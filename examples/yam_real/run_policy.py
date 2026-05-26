@@ -9,7 +9,6 @@ import time
 import traceback
 from typing import Any, Literal
 
-import cv2
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
@@ -51,12 +50,18 @@ class Args:
     image_transport: Literal["auto", "raw", "jpeg_q85_224_rgb_v1"] = "auto"
     prefetch_action_chunks: bool = True
     prefetch_remaining_steps: int | None = None
+    camera_fps: float = 30.0
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_pixel_format: str = "MJPG"
+    camera_startup_timeout_s: float = 5.0
+    max_camera_age_s: float = 0.25
 
 
 @dataclasses.dataclass
 class _CapturedObservation:
     state: np.ndarray
-    frames_bgr: dict[str, np.ndarray]
+    frames_rgb: dict[str, np.ndarray]
     capture_ms: float
     state_ms: float
     camera_ms: float
@@ -143,8 +148,13 @@ def _run_policy(args: Args) -> None:
         robots.append(follower_r)
         command = common.pack_bimanual(common.get_follower_state(follower_l), common.get_follower_state(follower_r))
 
-        _log("Opening cameras")
-        with common.CameraSet() as cameras:
+        camera_config = common.CameraConfig(
+            frame_size=(args.camera_width, args.camera_height),
+            fps=int(args.camera_fps),
+            pixel_format=args.camera_pixel_format,
+        )
+        _log(f"Opening cameras: {camera_config.as_manifest()}")
+        with common.AsyncCameraSet(config=camera_config, startup_timeout_s=args.camera_startup_timeout_s) as cameras:
             _log(f"Cameras ready: {', '.join(common.CAMERA_NAMES)}")
             dt = playback_timing.dt
             next_command_t = time.monotonic()
@@ -176,7 +186,12 @@ def _run_policy(args: Args) -> None:
                             pending_chunk = None
                             chunk_source = "prefetch"
                         else:
-                            captured = _capture_policy_observation(follower_l, follower_r, cameras)
+                            captured = _capture_policy_observation(
+                                follower_l,
+                                follower_r,
+                                cameras,
+                                max_camera_age_s=args.max_camera_age_s,
+                            )
                             _log(
                                 f"step={step}: requesting action chunk "
                                 f"(horizon={args.action_horizon}, capture_ms={captured.capture_ms:.1f}, "
@@ -255,7 +270,12 @@ def _run_policy(args: Args) -> None:
                         and pending_chunk is None
                         and remaining_steps == playback_timing.prefetch_remaining_steps
                     ):
-                        captured = _capture_policy_observation(follower_l, follower_r, cameras)
+                        captured = _capture_policy_observation(
+                            follower_l,
+                            follower_r,
+                            cameras,
+                            max_camera_age_s=args.max_camera_age_s,
+                        )
                         _log(
                             f"step={step}: prefetching next action chunk "
                             f"(remaining_steps={remaining_steps}, capture_ms={captured.capture_ms:.1f}, "
@@ -406,18 +426,24 @@ def _hold_inter_chunk_delay(
     return hold_ticks
 
 
-def _capture_policy_observation(follower_l, follower_r, cameras) -> _CapturedObservation:
+def _capture_policy_observation(
+    follower_l,
+    follower_r,
+    cameras: common.AsyncCameraSet,
+    *,
+    max_camera_age_s: float,
+) -> _CapturedObservation:
     capture_start = time.monotonic()
     state_start = time.monotonic()
     state = common.pack_bimanual(common.get_follower_state(follower_l), common.get_follower_state(follower_r))
     state_ms = _elapsed_ms(state_start)
 
     camera_start = time.monotonic()
-    frames = cameras.read()
+    snapshot = cameras.snapshot(max_age_s=max_camera_age_s)
     camera_ms = _elapsed_ms(camera_start)
     return _CapturedObservation(
         state=state,
-        frames_bgr=frames,
+        frames_rgb=snapshot.frames,
         capture_ms=_elapsed_ms(capture_start),
         state_ms=state_ms,
         camera_ms=camera_ms,
@@ -432,7 +458,7 @@ def _infer_action_chunk(
     image_transport: str,
 ) -> _ChunkResult:
     image_start = time.monotonic()
-    images = _policy_images(captured.frames_bgr, image_transport=image_transport)
+    images = _policy_images(captured.frames_rgb, image_transport=image_transport)
     image_ms = _elapsed_ms(image_start)
     observation = {
         "state": captured.state,
@@ -455,11 +481,10 @@ def _infer_action_chunk(
     )
 
 
-def _policy_images(frames_bgr: dict[str, np.ndarray], *, image_transport: str) -> dict[str, np.ndarray | bytes]:
+def _policy_images(frames_rgb: dict[str, np.ndarray], *, image_transport: str) -> dict[str, np.ndarray | bytes]:
     images = {}
-    for name, frame_bgr in frames_bgr.items():
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        rgb = image_tools.convert_to_uint8(image_tools.resize_with_pad(rgb, *jpeg_transport.IMAGE_RESOLUTION))
+    for name, frame_rgb in frames_rgb.items():
+        rgb = image_tools.convert_to_uint8(image_tools.resize_with_pad(frame_rgb, *jpeg_transport.IMAGE_RESOLUTION))
         if image_transport == jpeg_transport.IMAGE_TRANSPORT:
             images[name] = jpeg_transport.encode_rgb_jpeg(rgb)
         elif image_transport == "raw":

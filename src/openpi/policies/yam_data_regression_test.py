@@ -8,6 +8,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3]))
 
 from examples.yam_real import convert_yam_data_to_lerobot
 from examples.yam_real import data_regression
+from examples.yam_real import mcap_episode
 from examples.yam_real import read_yam_encoders
 from openpi import transforms
 from openpi.policies import yam_policy
@@ -65,6 +66,48 @@ def test_synthetic_mcap_canonical_round_trip(tmp_path: Path) -> None:
 
     assert diff == {"max_state_abs_error": 0.0, "max_action_abs_error": 0.0}
     assert summary["warnings"] == []
+
+
+def test_mcap_rows_can_reuse_latest_30hz_camera_frame(tmp_path: Path) -> None:
+    episode = data_regression.make_synthetic_episode(num_frames=4)
+    episode_dir = tmp_path / "mcap_reuse"
+    writer = mcap_episode.YamMcapEpisodeWriter(episode_dir, task=episode.task, fps=50.0, camera_fps=30.0)
+    try:
+        for row_idx in range(episode.num_frames):
+            camera_sequence = 0 if row_idx < 2 else row_idx - 1
+            camera_timestamp_ns = int((camera_sequence / 30.0) * 1_000_000_000)
+            frames = {
+                camera_name: np.full((480, 640, 3), 30 + camera_sequence + camera_idx, dtype=np.uint8)
+                for camera_idx, camera_name in enumerate(data_regression.CAMERA_NAMES)
+            }
+            writer.write_step(
+                frames_rgb=frames,
+                camera_metadata={
+                    camera_name: {
+                        "sequence_index": camera_sequence,
+                        "capture_timestamp_ns": camera_timestamp_ns,
+                    }
+                    for camera_name in data_regression.CAMERA_NAMES
+                },
+                state=episode.state[row_idx],
+                action=episode.action[row_idx],
+                timestamp_ns=int(episode.timestamps_s[row_idx] * 1_000_000_000),
+            )
+    finally:
+        writer.close()
+
+    actual = mcap_episode.read_episode(episode_dir, decode_images=True)
+
+    assert actual.images is not None
+    assert actual.images["cam_high"].shape == (4, 480, 640, 3)
+    assert actual.camera_frame_reuse is not None
+    assert actual.camera_frame_reuse["cam_high"] == {
+        "rows": 4,
+        "unique_frames": 3,
+        "reused_rows": 1,
+        "missing_rows": 0,
+    }
+    np.testing.assert_array_equal(actual.camera_timestamps_ns["cam_high"], np.asarray([0, 33_333_333, 66_666_666]))
 
 
 def test_npz_to_lerobot_conversion_preserves_gripper_values(tmp_path: Path, monkeypatch) -> None:

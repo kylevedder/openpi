@@ -43,6 +43,8 @@ dependencies = [
     "quic-portal[modal]==0.1.13",
     "mcap>=1.3.1",
     "mcap-protobuf-support>=0.5.4",
+    "linuxpy>=0.13.0",
+    "simplejpeg>=1.9.0",
 ]
 
 

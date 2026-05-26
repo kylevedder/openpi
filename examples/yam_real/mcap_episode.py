@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable
 import dataclasses
+import json
 from pathlib import Path
 import time
 
-import cv2
 from google.protobuf import timestamp_pb2
 from google.protobuf import wrappers_pb2
 import numpy as np
@@ -43,6 +44,7 @@ class FieldValueRef:
 
 @dataclasses.dataclass(frozen=True)
 class VideoUserdata:
+    camera_name: str
     field: pistream_mcap.FieldKey
     sequence_id: int
     timestamp_ns: int
@@ -56,6 +58,8 @@ class YamMcapEpisode:
     state: np.ndarray
     action: np.ndarray
     images: dict[str, np.ndarray] | None = None
+    camera_timestamps_ns: dict[str, np.ndarray] | None = None
+    camera_frame_reuse: dict[str, dict[str, int]] | None = None
 
 
 class YamMcapEpisodeWriter:
@@ -65,12 +69,15 @@ class YamMcapEpisodeWriter:
         *,
         task: str,
         fps: float,
+        camera_fps: float = 30.0,
         image_width: int = 640,
         image_height: int = 480,
+        camera_config: dict[str, object] | None = None,
     ) -> None:
         self._episode_dir = episode_dir
         self._fps = fps
-        self._field_specs = _build_field_specs(width=image_width, height=image_height, fps=fps)
+        self._camera_fps = camera_fps
+        self._field_specs = _build_field_specs(width=image_width, height=image_height, fps=camera_fps)
         self._snapshot_index = _snapshot_index(_snapshot_fields())
         self._writer = pistream_mcap.ShardedMcapWriter(
             episode_dir,
@@ -78,18 +85,24 @@ class YamMcapEpisodeWriter:
             metadata={
                 "task": task,
                 "fps": str(fps),
+                "row_fps": str(fps),
+                "camera_fps": str(camera_fps),
                 "created_at": str(time.time()),
-                "format": "openpi_yam_pistream_mcap",
+                "format": "openpi_yam_pistream_mcap_v2",
+                "image_color_space": "rgb24",
+                "camera_config": json.dumps(camera_config or {}, default=str, sort_keys=True),
             },
         )
         self._video_encoders = {
             camera_name: pistream_mcap.H264VideoEncoder[VideoUserdata](
                 width=image_width,
                 height=image_height,
-                fps=fps,
+                fps=camera_fps,
             )
             for camera_name in CAMERA_FIELD_MAP
         }
+        self._latest_camera_refs: dict[str, FieldValueRef] = {}
+        self._last_camera_sequence_index: dict[str, int] = {}
         self._last_timestamp_ns = 0
         self._num_steps = 0
         self._closed = False
@@ -105,7 +118,9 @@ class YamMcapEpisodeWriter:
     def write_step(
         self,
         *,
-        frames_bgr: dict[str, np.ndarray],
+        camera_snapshot=None,
+        frames_rgb: dict[str, np.ndarray] | None = None,
+        camera_metadata: dict[str, dict] | None = None,
         state: np.ndarray,
         action: np.ndarray,
         timestamp_ns: int,
@@ -113,22 +128,18 @@ class YamMcapEpisodeWriter:
         if self._closed:
             raise ValueError("Episode writer is closed.")
         timestamp_ns = self._monotonic_timestamp(timestamp_ns)
+        if camera_snapshot is not None:
+            frames_rgb = camera_snapshot.frames
+            camera_metadata = camera_snapshot.metadata
+        if frames_rgb is None:
+            raise ValueError("write_step requires camera_snapshot or frames_rgb")
+        camera_metadata = camera_metadata or {}
+        self._write_new_camera_frames(frames_rgb, camera_metadata, fallback_timestamp_ns=timestamp_ns)
+
         state_l, state_r = _split_bimanual(state)
         action_l, action_r = _split_bimanual(action)
 
-        snapshot_refs: list[FieldValueRef] = []
-        for camera_name, field in CAMERA_FIELD_MAP.items():
-            if camera_name not in frames_bgr:
-                raise KeyError(f"Missing camera frame {camera_name!r}")
-            sequence_id = self._writer.next_sequence(field.publisher_id)
-            snapshot_refs.append(FieldValueRef(field=field, sequence_id=sequence_id, timestamp_ns=timestamp_ns))
-            rgb = cv2.cvtColor(frames_bgr[camera_name], cv2.COLOR_BGR2RGB)
-            encoded_frames = self._video_encoders[camera_name].encode_rgb(
-                rgb,
-                userdata=VideoUserdata(field=field, sequence_id=sequence_id, timestamp_ns=timestamp_ns),
-            )
-            for encoded_frame in encoded_frames:
-                self._write_video_frame(encoded_frame)
+        snapshot_refs: list[FieldValueRef] = [self._latest_camera_ref(camera_name) for camera_name in CAMERA_FIELD_MAP]
 
         snapshot_refs.extend(self._write_follower_fields(LEFT_FOLLOWER, state_l, action_l, timestamp_ns))
         snapshot_refs.extend(self._write_follower_fields(RIGHT_FOLLOWER, state_r, action_r, timestamp_ns))
@@ -179,6 +190,51 @@ class YamMcapEpisodeWriter:
         self._last_timestamp_ns = timestamp_ns
         return timestamp_ns
 
+    def _write_new_camera_frames(
+        self,
+        frames_rgb: dict[str, np.ndarray],
+        camera_metadata: dict[str, dict],
+        *,
+        fallback_timestamp_ns: int,
+    ) -> None:
+        for camera_name, field in CAMERA_FIELD_MAP.items():
+            if camera_name not in frames_rgb:
+                raise KeyError(f"Missing camera frame {camera_name!r}")
+            metadata = camera_metadata.get(camera_name, {})
+            sequence_index = int(
+                metadata.get("sequence_index", self._last_camera_sequence_index.get(camera_name, -1) + 1)
+            )
+            if self._last_camera_sequence_index.get(camera_name) == sequence_index:
+                continue
+
+            capture_timestamp_ns = int(
+                metadata.get(
+                    "capture_timestamp_ns",
+                    int(float(metadata.get("capture_time_s", fallback_timestamp_ns / 1_000_000_000.0)) * 1e9),
+                )
+            )
+            sequence_id = self._writer.next_sequence(field.publisher_id)
+            encoded_frames = self._video_encoders[camera_name].encode_rgb(
+                frames_rgb[camera_name],
+                userdata=VideoUserdata(
+                    camera_name=camera_name,
+                    field=field,
+                    sequence_id=sequence_id,
+                    timestamp_ns=capture_timestamp_ns,
+                ),
+            )
+            for encoded_frame in encoded_frames:
+                self._write_video_frame(encoded_frame)
+            self._last_camera_sequence_index[camera_name] = sequence_index
+
+    def _latest_camera_ref(self, camera_name: str) -> FieldValueRef:
+        if camera_name not in self._latest_camera_refs:
+            raise RuntimeError(
+                f"No encoded camera frame is available for {camera_name!r}. "
+                "The H264 encoder did not emit a frame for the first camera sample."
+            )
+        return self._latest_camera_refs[camera_name]
+
     def _write_follower_fields(
         self,
         publisher_id: str,
@@ -213,6 +269,11 @@ class YamMcapEpisodeWriter:
             timestamp_ns=encoded_frame.userdata.timestamp_ns,
             sequence_id=encoded_frame.userdata.sequence_id,
         )
+        self._latest_camera_refs[encoded_frame.userdata.camera_name] = FieldValueRef(
+            field=encoded_frame.userdata.field,
+            sequence_id=encoded_frame.userdata.sequence_id,
+            timestamp_ns=encoded_frame.userdata.timestamp_ns,
+        )
 
     def _make_snapshot_ref(self, refs: Iterable[FieldValueRef]) -> frame_pb2.PiStreamSnapshotRef:
         snapshot = frame_pb2.PiStreamSnapshotRef()
@@ -228,12 +289,15 @@ class YamMcapEpisodeWriter:
 def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpisode:
     _validate_expected_shards(episode_dir)
     metadata = pistream_mcap.read_mcap_metadata(episode_dir)
-    arrays: dict[pistream_mcap.FieldKey, dict[int, np.ndarray]] = {
+    arrays_by_sequence: dict[pistream_mcap.FieldKey, dict[int, np.ndarray]] = {
         field: {} for field in _required_state_action_fields()
     }
-    camera_timestamps: dict[str, set[int]] = {camera_name: set() for camera_name in CAMERA_FIELD_MAP}
-    images: dict[str, dict[int, np.ndarray]] = {camera_name: {} for camera_name in CAMERA_FIELD_MAP}
-    step_timestamps: set[int] = set()
+    images_by_sequence: dict[str, dict[int, np.ndarray]] = {camera_name: {} for camera_name in CAMERA_FIELD_MAP}
+    video_pending_sequences: dict[str, deque[tuple[int, int]]] = {
+        camera_name: deque() for camera_name in CAMERA_FIELD_MAP
+    }
+    snapshots: list[tuple[int, dict[pistream_mcap.FieldKey, FieldValueRef]]] = []
+    snapshot_field_by_index = {index: field for field, index in _snapshot_index(_snapshot_fields()).items()}
     decoders = (
         {camera_name: pistream_mcap.H264VideoDecoder() for camera_name in CAMERA_FIELD_MAP} if decode_images else {}
     )
@@ -244,61 +308,85 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
         if not channel.topic.startswith(pistream_mcap.PI_STREAM_FRAME_PREFIX):
             continue
         field = pistream_mcap.parse_frame_topic(channel.topic)
-        if field in arrays:
+        if field in arrays_by_sequence:
             decoded = frame_pb2.DoubleList()
             decoded.ParseFromString(message.data)
-            arrays[field][message.log_time] = pistream_mcap.parse_double_list(decoded, _field_shape(field))
-        elif field == ACTION_START_FIELD:
-            step_timestamps.add(message.log_time)
+            arrays_by_sequence[field][message.sequence] = pistream_mcap.parse_double_list(decoded, _field_shape(field))
+        elif field == ACTION_SNAPSHOT_FIELD:
+            snapshot = frame_pb2.PiStreamSnapshotRef()
+            snapshot.ParseFromString(message.data)
+            refs: dict[pistream_mcap.FieldKey, FieldValueRef] = {}
+            for ref in snapshot.fields:
+                ref_field = snapshot_field_by_index.get(
+                    ref.index,
+                    pistream_mcap.FieldKey(ref.publisher_id, ref.key) if ref.publisher_id and ref.key else None,
+                )
+                if ref_field is None:
+                    continue
+                refs[ref_field] = FieldValueRef(
+                    field=ref_field,
+                    sequence_id=ref.sequence_id,
+                    timestamp_ns=pistream_mcap.timestamp_to_nanos(ref.capture_timestamp),
+                )
+            snapshots.append((message.log_time, refs))
         elif field in set(CAMERA_FIELD_MAP.values()):
             video_frame = frame_pb2.VideoFrame()
             video_frame.ParseFromString(message.data)
             camera_name = _camera_name_for_field(field)
-            camera_timestamps[camera_name].add(message.log_time)
             if decode_images:
+                video_pending_sequences[camera_name].append((message.sequence, message.log_time))
                 for image in decoders[camera_name].decode_to_rgb(video_frame):
-                    images[camera_name][message.log_time] = image
-
-    timestamps = _validate_required_timestamps(
-        episode_dir,
-        step_timestamps=step_timestamps,
-        arrays=arrays,
-        camera_timestamps=camera_timestamps,
-        images=images if decode_images else None,
-    )
+                    sequence_id, _timestamp_ns = video_pending_sequences[camera_name].popleft()
+                    images_by_sequence[camera_name][sequence_id] = image
     if decode_images:
-        _finalize_video_decoders(decoders)
+        _finalize_video_decoders(decoders, pending_sequences=video_pending_sequences, images=images_by_sequence)
+
+    snapshots = _validate_snapshots(episode_dir, snapshots=snapshots, arrays=arrays_by_sequence)
     state = []
     action = []
-    for timestamp_ns in timestamps:
+    images_by_row: dict[str, list[np.ndarray]] = {camera_name: [] for camera_name in CAMERA_FIELD_MAP}
+    camera_row_timestamps: dict[str, list[int]] = {camera_name: [] for camera_name in CAMERA_FIELD_MAP}
+    for _timestamp_ns, refs in snapshots:
         state.append(
             np.concatenate(
                 [
-                    arrays[_observation_joints_field(LEFT_FOLLOWER)][timestamp_ns],
-                    arrays[_observation_gripper_field(LEFT_FOLLOWER)][timestamp_ns],
-                    arrays[_observation_joints_field(RIGHT_FOLLOWER)][timestamp_ns],
-                    arrays[_observation_gripper_field(RIGHT_FOLLOWER)][timestamp_ns],
+                    _array_for_ref(arrays_by_sequence, refs, _observation_joints_field(LEFT_FOLLOWER)),
+                    _array_for_ref(arrays_by_sequence, refs, _observation_gripper_field(LEFT_FOLLOWER)),
+                    _array_for_ref(arrays_by_sequence, refs, _observation_joints_field(RIGHT_FOLLOWER)),
+                    _array_for_ref(arrays_by_sequence, refs, _observation_gripper_field(RIGHT_FOLLOWER)),
                 ]
             ).astype(np.float32)
         )
         action.append(
             np.concatenate(
                 [
-                    arrays[_action_joints_field(LEFT_FOLLOWER)][timestamp_ns],
-                    arrays[_action_gripper_field(LEFT_FOLLOWER)][timestamp_ns],
-                    arrays[_action_joints_field(RIGHT_FOLLOWER)][timestamp_ns],
-                    arrays[_action_gripper_field(RIGHT_FOLLOWER)][timestamp_ns],
+                    _array_for_ref(arrays_by_sequence, refs, _action_joints_field(LEFT_FOLLOWER)),
+                    _array_for_ref(arrays_by_sequence, refs, _action_gripper_field(LEFT_FOLLOWER)),
+                    _array_for_ref(arrays_by_sequence, refs, _action_joints_field(RIGHT_FOLLOWER)),
+                    _array_for_ref(arrays_by_sequence, refs, _action_gripper_field(RIGHT_FOLLOWER)),
                 ]
             ).astype(np.float32)
         )
+        for camera_name, field in CAMERA_FIELD_MAP.items():
+            ref = _ref_for_field(refs, field)
+            camera_row_timestamps[camera_name].append(ref.timestamp_ns)
+            if decode_images:
+                try:
+                    images_by_row[camera_name].append(images_by_sequence[camera_name][ref.sequence_id])
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"MCAP episode {episode_dir} is missing decoded image for "
+                        f"{camera_name} sequence {ref.sequence_id}"
+                    ) from exc
 
     image_arrays = None
     if decode_images:
-        image_arrays = {
-            camera_name: np.stack([camera_images[timestamp_ns] for timestamp_ns in timestamps], axis=0)
-            for camera_name, camera_images in images.items()
-        }
-    timestamps_ns = np.asarray(timestamps, dtype=np.int64)
+        image_arrays = {camera_name: np.stack(images, axis=0) for camera_name, images in images_by_row.items()}
+    timestamps_ns = np.asarray([timestamp_ns for timestamp_ns, _refs in snapshots], dtype=np.int64)
+    camera_timestamps_ns = {
+        camera_name: np.asarray(_unique_preserve_order(values), dtype=np.int64)
+        for camera_name, values in camera_row_timestamps.items()
+    }
     return YamMcapEpisode(
         task=metadata.get("task", ""),
         fps=_fps_from_metadata_or_timestamps(metadata, timestamps_ns),
@@ -306,6 +394,16 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
         state=np.asarray(state, dtype=np.float32),
         action=np.asarray(action, dtype=np.float32),
         images=image_arrays,
+        camera_timestamps_ns=camera_timestamps_ns,
+        camera_frame_reuse={
+            camera_name: {
+                "rows": len(values),
+                "unique_frames": len(set(values)),
+                "reused_rows": len(values) - len(set(values)),
+                "missing_rows": 0,
+            }
+            for camera_name, values in camera_row_timestamps.items()
+        },
     )
 
 
@@ -451,6 +549,8 @@ def _camera_name_for_field(field: pistream_mcap.FieldKey) -> str:
 
 
 def _fps_from_metadata_or_timestamps(metadata: dict[str, str], timestamps_ns: np.ndarray) -> float:
+    if metadata.get("row_fps"):
+        return float(metadata["row_fps"])
     if metadata.get("fps"):
         return float(metadata["fps"])
     if len(timestamps_ns) < 2:
@@ -473,38 +573,70 @@ def _validate_expected_shards(episode_dir: Path) -> None:
         raise FileNotFoundError(f"MCAP episode {episode_dir} is missing shard(s): {missing}")
 
 
-def _validate_required_timestamps(
+def _validate_snapshots(
     episode_dir: Path,
     *,
-    step_timestamps: set[int],
+    snapshots: list[tuple[int, dict[pistream_mcap.FieldKey, FieldValueRef]]],
     arrays: dict[pistream_mcap.FieldKey, dict[int, np.ndarray]],
-    camera_timestamps: dict[str, set[int]],
-    images: dict[str, dict[int, np.ndarray]] | None,
-) -> list[int]:
-    if not step_timestamps:
-        raise RuntimeError(f"No action_start_timestamp steps found in MCAP episode {episode_dir}")
-
-    expected = set(step_timestamps)
-    for field, values in arrays.items():
-        _validate_timestamp_set(episode_dir, f"{field.publisher_id}/{field.key}", expected, set(values))
-    for camera_name, timestamps in camera_timestamps.items():
-        _validate_timestamp_set(episode_dir, f"{camera_name} video messages", expected, timestamps)
-    if images is not None:
-        for camera_name, values in images.items():
-            _validate_timestamp_set(episode_dir, f"{camera_name} decoded images", expected, set(values))
-    return sorted(expected)
-
-
-def _validate_timestamp_set(episode_dir: Path, name: str, expected: set[int], actual: set[int]) -> None:
-    missing = sorted(expected - actual)
-    extra = sorted(actual - expected)
-    if missing or extra:
-        raise RuntimeError(
-            f"MCAP episode {episode_dir} has inconsistent timestamps for {name}: "
-            f"missing={len(missing)}, extra={len(extra)}"
-        )
+) -> list[tuple[int, dict[pistream_mcap.FieldKey, FieldValueRef]]]:
+    if not snapshots:
+        raise RuntimeError(f"No action_snapshot rows found in MCAP episode {episode_dir}")
+    snapshots = sorted(snapshots, key=lambda item: item[0])
+    required_fields = [*CAMERA_FIELD_MAP.values(), *_required_state_action_fields()]
+    for row_index, (_timestamp_ns, refs) in enumerate(snapshots):
+        missing_refs = [field for field in required_fields if field not in refs]
+        if missing_refs:
+            names = [f"{field.publisher_id}/{field.key}" for field in missing_refs]
+            raise RuntimeError(f"MCAP episode {episode_dir} row {row_index} is missing snapshot refs: {names}")
+        for field in _required_state_action_fields():
+            ref = refs[field]
+            if ref.sequence_id not in arrays[field]:
+                raise RuntimeError(
+                    f"MCAP episode {episode_dir} row {row_index} references missing "
+                    f"{field.publisher_id}/{field.key} sequence {ref.sequence_id}"
+                )
+    return snapshots
 
 
-def _finalize_video_decoders(decoders: dict[str, pistream_mcap.H264VideoDecoder]) -> None:
-    for decoder in decoders.values():
-        decoder.finalize()
+def _array_for_ref(
+    arrays: dict[pistream_mcap.FieldKey, dict[int, np.ndarray]],
+    refs: dict[pistream_mcap.FieldKey, FieldValueRef],
+    field: pistream_mcap.FieldKey,
+) -> np.ndarray:
+    ref = _ref_for_field(refs, field)
+    return arrays[field][ref.sequence_id]
+
+
+def _ref_for_field(
+    refs: dict[pistream_mcap.FieldKey, FieldValueRef],
+    field: pistream_mcap.FieldKey,
+) -> FieldValueRef:
+    try:
+        return refs[field]
+    except KeyError as exc:
+        raise RuntimeError(f"Snapshot is missing field {field.publisher_id}/{field.key}") from exc
+
+
+def _unique_preserve_order(values: Iterable[int]) -> list[int]:
+    seen = set()
+    unique = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def _finalize_video_decoders(
+    decoders: dict[str, pistream_mcap.H264VideoDecoder],
+    *,
+    pending_sequences: dict[str, deque[tuple[int, int]]],
+    images: dict[str, dict[int, np.ndarray]],
+) -> None:
+    for camera_name, decoder in decoders.items():
+        for frame in decoder.finalize():
+            if not pending_sequences[camera_name]:
+                break
+            sequence_id, _timestamp_ns = pending_sequences[camera_name].popleft()
+            images[camera_name][sequence_id] = frame.to_ndarray(format="rgb24")

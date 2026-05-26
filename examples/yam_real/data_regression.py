@@ -4,7 +4,7 @@ import dataclasses
 import json
 from pathlib import Path
 import time
-from typing import Literal
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -31,6 +31,10 @@ class CanonicalEpisode:
     action: np.ndarray
     timestamps_s: np.ndarray
     image_counts: dict[str, int]
+    row_fps: float | None = None
+    camera_fps: float | None = None
+    camera_timestamps_s: dict[str, np.ndarray] = dataclasses.field(default_factory=dict)
+    camera_frame_reuse: dict[str, dict[str, int]] = dataclasses.field(default_factory=dict)
 
     @property
     def num_frames(self) -> int:
@@ -177,15 +181,24 @@ def load_npz_episode(episode_dir: Path) -> CanonicalEpisode:
     timestamps_s = np.asarray(arrays.get("timestamp", np.arange(len(state))), dtype=np.float64)
     image_paths = arrays.get("image_paths")
     image_counts = _image_counts_from_npz(image_paths)
+    camera_timestamps_s, camera_frame_reuse = _camera_timestamps_from_npz_metadata(
+        arrays.get("camera_frame_metadata"),
+        num_rows=len(state),
+    )
+    fps = float(manifest.get("row_fps", manifest.get("fps", 0.0)))
     return CanonicalEpisode(
         source_path=episode_dir,
         source_format="npz",
         task=str(manifest.get("task", "")),
-        fps=float(manifest.get("fps", 0.0)),
+        fps=fps,
         state=state,
         action=action,
         timestamps_s=timestamps_s,
         image_counts=image_counts,
+        row_fps=fps,
+        camera_fps=float(manifest["camera_fps"]) if manifest.get("camera_fps") is not None else None,
+        camera_timestamps_s=camera_timestamps_s,
+        camera_frame_reuse=camera_frame_reuse,
     )
 
 
@@ -197,6 +210,10 @@ def load_mcap_episode(episode_dir: Path) -> CanonicalEpisode:
     action = _as_float_matrix(episode.action, "action", episode_dir)
     _validate_state_action_shapes(state, action, episode_dir)
     timestamps_s = np.asarray(episode.timestamps_ns, dtype=np.float64) / 1_000_000_000.0
+    camera_timestamps_s = {
+        camera_name: np.asarray(timestamps_ns, dtype=np.float64) / 1_000_000_000.0
+        for camera_name, timestamps_ns in (episode.camera_timestamps_ns or {}).items()
+    }
     return CanonicalEpisode(
         source_path=episode_dir,
         source_format="mcap",
@@ -206,6 +223,10 @@ def load_mcap_episode(episode_dir: Path) -> CanonicalEpisode:
         action=action,
         timestamps_s=timestamps_s,
         image_counts={camera_name: len(state) for camera_name in CAMERA_NAMES},
+        row_fps=float(episode.fps),
+        camera_fps=_infer_camera_fps(camera_timestamps_s),
+        camera_timestamps_s=camera_timestamps_s,
+        camera_frame_reuse=episode.camera_frame_reuse or {},
     )
 
 
@@ -258,9 +279,13 @@ def summarize_episode(
         "source_format": episode.source_format,
         "task": episode.task,
         "fps": episode.fps,
+        "row_fps": episode.row_fps,
+        "camera_fps": episode.camera_fps,
         "num_frames": episode.num_frames,
         "duration_s": _duration_s(episode.timestamps_s),
         "timing": _timestamp_stats(episode.timestamps_s, fps=episode.fps),
+        "camera_timing": _camera_timing_stats(episode),
+        "camera_frame_reuse": episode.camera_frame_reuse,
         "image_counts": episode.image_counts,
         "state_stats": _matrix_stats(episode.state),
         "action_stats": _matrix_stats(episode.action),
@@ -327,6 +352,18 @@ def summarize_episode(
         for camera_name in CAMERA_NAMES
         if episode.image_counts.get(camera_name, 0) != episode.num_frames
     )
+    if episode.camera_fps:
+        expected_dt_s = 1.0 / episode.camera_fps
+        for camera_name, timing in record["camera_timing"].items():
+            if timing["num_intervals"] == 0:
+                continue
+            median_dt_s = float(timing["median_dt_s"])
+            median_error_ratio = abs(median_dt_s - expected_dt_s) / expected_dt_s
+            if median_error_ratio > max_median_dt_error_ratio:
+                warnings.append(
+                    f"{camera_name} camera median dt {median_dt_s:.4f}s does not match camera_fps="
+                    f"{episode.camera_fps:g} (expected {expected_dt_s:.4f}s, error_ratio={median_error_ratio:.2f})"
+                )
     return record
 
 
@@ -431,11 +468,20 @@ def write_mcap_fixture(episode: CanonicalEpisode, episode_dir: Path) -> Path:
                 camera_name: np.full((480, 640, 3), frame_idx * 10 + camera_idx, dtype=np.uint8)
                 for camera_idx, camera_name in enumerate(CAMERA_NAMES)
             }
+            timestamp_ns = int(episode.timestamps_s[frame_idx] * 1_000_000_000)
             writer.write_step(
-                frames_bgr=frames,
+                frames_rgb=frames,
+                camera_metadata={
+                    camera_name: {
+                        "sequence_index": frame_idx,
+                        "capture_timestamp_ns": timestamp_ns,
+                        "capture_time_s": timestamp_ns / 1_000_000_000.0,
+                    }
+                    for camera_name in CAMERA_NAMES
+                },
                 state=episode.state[frame_idx],
                 action=episode.action[frame_idx],
-                timestamp_ns=int(episode.timestamps_s[frame_idx] * 1_000_000_000),
+                timestamp_ns=timestamp_ns,
             )
     finally:
         writer.close()
@@ -472,6 +518,91 @@ def _image_counts_from_npz(image_paths: np.ndarray | None) -> dict[str, int]:
             if camera_name in paths:
                 counts[camera_name] += 1
     return counts
+
+
+def _camera_timestamps_from_npz_metadata(
+    metadata_array: np.ndarray | None,
+    *,
+    num_rows: int,
+) -> tuple[dict[str, np.ndarray], dict[str, dict[str, int]]]:
+    if metadata_array is None:
+        return {}, {}
+
+    timestamps: dict[str, list[float]] = {camera_name: [] for camera_name in CAMERA_NAMES}
+    row_counts: dict[str, int] = dict.fromkeys(CAMERA_NAMES, 0)
+    last_sequence: dict[str, int] = {}
+    for entry in metadata_array:
+        metadata = entry.item() if hasattr(entry, "item") else entry
+        if not isinstance(metadata, dict):
+            continue
+        for camera_name in CAMERA_NAMES:
+            camera_metadata = metadata.get(camera_name)
+            if not isinstance(camera_metadata, dict):
+                continue
+            row_counts[camera_name] += 1
+            sequence_index = _metadata_int(camera_metadata.get("sequence_index"))
+            capture_time_s = _metadata_float(camera_metadata.get("capture_time_s"))
+            if capture_time_s is None:
+                continue
+            if sequence_index is None or last_sequence.get(camera_name) != sequence_index:
+                timestamps[camera_name].append(capture_time_s)
+                if sequence_index is not None:
+                    last_sequence[camera_name] = sequence_index
+
+    arrays = {camera_name: np.asarray(values, dtype=np.float64) for camera_name, values in timestamps.items() if values}
+    reuse = {}
+    for camera_name in CAMERA_NAMES:
+        unique_frames = len(arrays.get(camera_name, ()))
+        rows_with_camera = int(row_counts.get(camera_name, 0))
+        if rows_with_camera:
+            reuse[camera_name] = {
+                "rows": rows_with_camera,
+                "unique_frames": unique_frames,
+                "reused_rows": max(0, rows_with_camera - unique_frames),
+                "missing_rows": max(0, num_rows - rows_with_camera),
+            }
+    return arrays, reuse
+
+
+def _metadata_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    with np.errstate(all="ignore"):
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+    return result if np.isfinite(result) else None
+
+
+def _metadata_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _camera_timing_stats(episode: CanonicalEpisode) -> dict[str, dict[str, float | int]]:
+    fps = float(episode.camera_fps or 0.0)
+    return {
+        camera_name: _timestamp_stats(timestamps_s, fps=fps)
+        for camera_name, timestamps_s in sorted(episode.camera_timestamps_s.items())
+    }
+
+
+def _infer_camera_fps(camera_timestamps_s: dict[str, np.ndarray]) -> float | None:
+    medians = []
+    for timestamps in camera_timestamps_s.values():
+        if len(timestamps) < 2:
+            continue
+        diffs = np.diff(np.asarray(timestamps, dtype=np.float64))
+        if diffs.size and np.median(diffs) > 0:
+            medians.append(float(1.0 / np.median(diffs)))
+    if not medians:
+        return None
+    return float(np.median(medians))
 
 
 def _gripper_stats(
