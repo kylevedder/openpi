@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package monopi.pi_stream;
+
+import "openpi/pistream/proto/encoding.proto";
+
+// A complete descriptor for all data communicated by a PiStream.
+message PiStreamDescriptor {
+  repeated FieldDescriptor fields = 1;
+}
+
+// A descriptor for a single field in a PiStream.
+message FieldDescriptor {
+  // The publisher ID of the sender.
+  string publisher_id = 1;
+
+  // The key of the field.
+  string key = 2;
+
+  // The encoding of the field.
+  Encoding encoding = 3;
+}
+

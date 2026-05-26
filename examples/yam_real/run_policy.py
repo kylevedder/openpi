@@ -35,6 +35,8 @@ class Args:
     prompt: str = "perform the demonstrated bimanual task"
     execute: bool = False
     fps: float = 50.0
+    action_playback_fps: float | None = None
+    inter_chunk_delay_s: float = 0.0
     max_steps: int = 200
     action_horizon: int = 50
     gripper: Literal["crank_4310", "linear_3507", "linear_4310"] = "linear_4310"
@@ -48,7 +50,7 @@ class Args:
     log_dir: Path = Path("yam_data/logs/run_policy")
     image_transport: Literal["auto", "raw", "jpeg_q85_224_rgb_v1"] = "auto"
     prefetch_action_chunks: bool = True
-    prefetch_remaining_steps: int = 30
+    prefetch_remaining_steps: int | None = None
 
 
 @dataclasses.dataclass
@@ -73,6 +75,17 @@ class _ChunkResult:
     client_timing: dict[str, Any]
 
 
+@dataclasses.dataclass(frozen=True)
+class _PlaybackTiming:
+    policy_fps: float
+    playback_fps: float
+    dt: float
+    playback_slowdown: float
+    inter_chunk_delay_s: float
+    prefetch_remaining_steps: int
+    prefetch_lead_s: float
+
+
 def main(args: Args) -> None:
     log_path = _make_run_log_path(args.log_dir)
     with _tee_output(log_path):
@@ -93,9 +106,13 @@ def _run_policy(args: Args) -> None:
     from i2rt.robots.utils import GripperType
 
     policy_endpoint = _policy_endpoint(args)
+    playback_timing = _resolve_playback_timing(args)
     _log(
         f"execute={args.execute}; transport={args.transport}; endpoint={policy_endpoint}; max_steps={args.max_steps}; "
-        f"fps={args.fps:g}; action_horizon={args.action_horizon}"
+        f"policy_fps={playback_timing.policy_fps:g}; action_playback_fps={playback_timing.playback_fps:g}; "
+        f"playback_slowdown={playback_timing.playback_slowdown:.2f}x; "
+        f"inter_chunk_delay_s={playback_timing.inter_chunk_delay_s:g}; action_horizon={args.action_horizon}; "
+        f"prefetch_remaining_steps={playback_timing.prefetch_remaining_steps}"
     )
     if not args.execute:
         _log("Dry run only. Observations will be sent to the server, but followers will not be commanded.")
@@ -129,18 +146,18 @@ def _run_policy(args: Args) -> None:
         _log("Opening cameras")
         with common.CameraSet() as cameras:
             _log(f"Cameras ready: {', '.join(common.CAMERA_NAMES)}")
-            dt = 1.0 / args.fps
+            dt = playback_timing.dt
             next_command_t = time.monotonic()
             last_command_t: float | None = None
             chunk_actions: np.ndarray | None = None
             chunk_step = args.action_horizon
             chunk_index = -1
             pending_chunk: concurrent.futures.Future[_ChunkResult] | None = None
-            prefetch_remaining_steps = max(0, min(args.prefetch_remaining_steps, args.action_horizon - 1))
             _log(
                 "Starting policy loop "
                 f"(prefetch_action_chunks={args.prefetch_action_chunks}, "
-                f"prefetch_remaining_steps={prefetch_remaining_steps})"
+                f"prefetch_remaining_steps={playback_timing.prefetch_remaining_steps}, "
+                f"prefetch_lead_s={playback_timing.prefetch_lead_s:.3f})"
             )
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as chunk_executor:
                 for step in range(args.max_steps):
@@ -230,15 +247,13 @@ def _run_policy(args: Args) -> None:
                     next_command_t = command_t + dt
 
                     if args.execute:
-                        left, right = common.split_bimanual(command)
-                        follower_l.command_joint_pos(common.openpi_arm_state_to_i2rt(left))
-                        follower_r.command_joint_pos(common.openpi_arm_state_to_i2rt(right))
+                        _command_followers(command, follower_l, follower_r)
 
                     remaining_steps = len(chunk_actions) - chunk_step
                     if (
                         args.prefetch_action_chunks
                         and pending_chunk is None
-                        and remaining_steps == prefetch_remaining_steps
+                        and remaining_steps == playback_timing.prefetch_remaining_steps
                     ):
                         captured = _capture_policy_observation(follower_l, follower_r, cameras)
                         _log(
@@ -281,6 +296,16 @@ def _run_policy(args: Args) -> None:
                             f"max_delta={max_delta:.4f}",
                             flush=True,
                         )
+
+                    if chunk_step >= len(chunk_actions) and step + 1 < args.max_steps:
+                        _hold_inter_chunk_delay(
+                            command=command,
+                            follower_l=follower_l,
+                            follower_r=follower_r,
+                            chunk_index=chunk_index,
+                            playback_timing=playback_timing,
+                            execute=args.execute,
+                        )
     finally:
         with contextlib.suppress(Exception):
             close = getattr(policy_client, "close", None)
@@ -291,6 +316,94 @@ def _run_policy(args: Args) -> None:
             with contextlib.suppress(Exception):
                 robot.close()
         _log("Policy runner stopped")
+
+
+def _resolve_playback_timing(args: Args) -> _PlaybackTiming:
+    policy_fps = float(args.fps)
+    if policy_fps <= 0:
+        raise ValueError(f"--fps must be positive, got {args.fps!r}")
+    if args.action_horizon <= 0:
+        raise ValueError(f"--action-horizon must be positive, got {args.action_horizon!r}")
+
+    playback_fps = policy_fps if args.action_playback_fps is None else float(args.action_playback_fps)
+    if playback_fps <= 0:
+        raise ValueError(f"--action-playback-fps must be positive, got {args.action_playback_fps!r}")
+    if playback_fps > policy_fps:
+        raise ValueError(
+            "--action-playback-fps must be less than or equal to --fps "
+            f"({playback_fps:g} > {policy_fps:g})"
+        )
+    inter_chunk_delay_s = float(args.inter_chunk_delay_s)
+    if inter_chunk_delay_s < 0:
+        raise ValueError(f"--inter-chunk-delay-s must be non-negative, got {args.inter_chunk_delay_s!r}")
+
+    default_prefetch_remaining_steps_at_policy_fps = 30
+    if args.prefetch_remaining_steps is None:
+        prefetch_lead_s = default_prefetch_remaining_steps_at_policy_fps / policy_fps
+        prefetch_remaining_steps = round(prefetch_lead_s * playback_fps)
+    else:
+        prefetch_remaining_steps = int(args.prefetch_remaining_steps)
+        prefetch_lead_s = prefetch_remaining_steps / playback_fps
+
+    prefetch_remaining_steps = max(0, min(prefetch_remaining_steps, args.action_horizon - 1))
+    return _PlaybackTiming(
+        policy_fps=policy_fps,
+        playback_fps=playback_fps,
+        dt=1.0 / playback_fps,
+        playback_slowdown=policy_fps / playback_fps,
+        inter_chunk_delay_s=inter_chunk_delay_s,
+        prefetch_remaining_steps=prefetch_remaining_steps,
+        prefetch_lead_s=prefetch_lead_s,
+    )
+
+
+def _command_followers(command: np.ndarray, follower_l, follower_r) -> None:
+    left, right = common.split_bimanual(command)
+    follower_l.command_joint_pos(common.openpi_arm_state_to_i2rt(left))
+    follower_r.command_joint_pos(common.openpi_arm_state_to_i2rt(right))
+
+
+def _hold_inter_chunk_delay(
+    *,
+    command: np.ndarray,
+    follower_l,
+    follower_r,
+    chunk_index: int,
+    playback_timing: _PlaybackTiming,
+    execute: bool,
+) -> int:
+    if playback_timing.inter_chunk_delay_s <= 0:
+        return 0
+
+    delay_s = playback_timing.inter_chunk_delay_s
+    _log(
+        f"chunk={chunk_index}: inter-chunk delay start "
+        f"delay_s={delay_s:g} hold_fps={playback_timing.playback_fps:g} execute={execute}"
+    )
+    start_t = time.monotonic()
+    end_t = start_t + delay_s
+    next_hold_t = start_t
+    hold_ticks = 0
+    while True:
+        now = time.monotonic()
+        if now >= end_t:
+            break
+        sleep_s = min(max(0.0, next_hold_t - now), end_t - now)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+            now = time.monotonic()
+            if now >= end_t:
+                break
+        if execute:
+            _command_followers(command, follower_l, follower_r)
+        hold_ticks += 1
+        next_hold_t += playback_timing.dt
+
+    remaining_s = end_t - time.monotonic()
+    if remaining_s > 0:
+        time.sleep(remaining_s)
+    _log(f"chunk={chunk_index}: inter-chunk delay done hold_ticks={hold_ticks}")
+    return hold_ticks
 
 
 def _capture_policy_observation(follower_l, follower_r, cameras) -> _CapturedObservation:

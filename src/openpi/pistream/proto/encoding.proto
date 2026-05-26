@@ -1,0 +1,178 @@
+syntax = "proto3";
+
+package monopi.pi_stream;
+
+import "google/protobuf/descriptor.proto";
+import "google/protobuf/struct.proto";
+
+// Uniquely describes the content and wire format of PiFieldValues for a PiField.
+message Encoding {
+  oneof content {
+    BoolContent bool_content = 1;
+    IntegerContent int_content = 2;
+    DoubleContent double_content = 3;
+    StringContent string_content = 4;
+    BytesContent bytes_content = 5;
+    BoolListContent bool_list = 6;
+    IntegerListContent int_list = 7;
+    DoubleListContent double_list = 8;
+    StringListContent string_list = 9;
+    BytesListContent bytes_list = 10;
+    NDArrayContent ndarray = 11;
+    JsonMsgContent json_msg = 12;
+    ProtoMsgContent proto_msg = 13;
+    PiStreamSnapshotRefContent snapshot_ref = 14;
+    TimestampContent timestamp = 15;
+    DurationContent duration = 16;
+    VideoContent video = 17;
+    DepthVideoContent depth_video = 18;
+  }
+}
+
+message DefaultEncoding {}
+
+message BoolContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message IntegerContent {
+  oneof encoding {
+    Int32Encoding int32_value = 1;
+    Int64Encoding int64_value = 2;
+  }
+}
+message Int32Encoding {}
+message Int64Encoding {}
+
+message DoubleContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message StringContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message BytesContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message BoolListContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message IntegerListContent {
+  oneof encoding {
+    Int32ListValueEncoding int32_list = 1;
+    Int64ListValueEncoding int64_list = 2;
+  }
+}
+message Int32ListValueEncoding {}
+message Int64ListValueEncoding {}
+
+message DoubleListContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message StringListContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message BytesListContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message TimestampContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+message DurationContent {
+  oneof encoding {
+    DefaultEncoding default_encoding = 1;
+  }
+}
+
+message NDArrayContent {
+  repeated int32 shape = 1;
+  string dtype = 2;
+
+  oneof encoding {
+    DefaultEncoding default_encoding = 3;
+  }
+}
+
+message JsonMsgContent {
+  google.protobuf.Struct schema = 1;
+  uint64 version = 2;
+
+  oneof encoding {
+    DefaultEncoding default_encoding = 3;
+  }
+}
+
+message ProtoMsgContent {
+  string full_name = 1;
+  uint64 version = 2;
+
+  oneof encoding {
+    DefaultEncoding default_encoding = 3;
+  }
+}
+
+message PiStreamSnapshotRefContent {
+  message FieldIndexMapEntry {
+    string publisher_id = 1;
+    string key = 2;
+    uint32 index = 3;
+  }
+
+  repeated FieldIndexMapEntry field_index_map = 1;
+
+  oneof encoding {
+    DefaultEncoding default_encoding = 2;
+  }
+}
+
+message VideoContent {
+  uint32 width = 1;
+  uint32 height = 2;
+  string pix_fmt = 3;
+
+  oneof encoding {
+    DefaultEncoding default_encoding = 4;
+    CompressedVideoEncoding compressed_encoding = 5;
+  }
+}
+
+message CompressedVideoEncoding {
+  string codec = 1;
+  string encoder = 2;
+  int32 fps = 3;
+
+  message EncoderOption {
+    string name = 1;
+    string value = 2;
+  }
+
+  repeated EncoderOption options = 4;
+}
+
+message DepthVideoContent {
+  uint32 width = 1;
+  uint32 height = 2;
+  string pix_fmt = 3;
+  double scale = 4;
+
+  oneof encoding {
+    DefaultEncoding default_encoding = 5;
+  }
+}
+

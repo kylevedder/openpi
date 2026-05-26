@@ -213,6 +213,30 @@ advertises `jpeg_q85_224_rgb_v1`, so the local robot host sends compressed `224x
 `run_policy` also prefetches the next action chunk by default when the current 50-step chunk has 30 steps remaining.
 Disable with `--no-prefetch-action-chunks` when debugging strictly synchronous inference timing.
 
+For slow-motion debugging, keep `--fps 50` so the policy metadata still matches the trained model, and set
+`--action-playback-fps` to the slower command rate. `--max-steps` is still an action-row count, not seconds, so
+`--action-playback-fps 10 --max-steps 1200` runs for about 2 minutes.
+Add `--inter-chunk-delay-s` to insert a hold pause after each completed action chunk; this delay does not count
+against `--max-steps`.
+
+```bash
+uv run python -m examples.yam_real.run_policy \
+  --transport modal-quic \
+  --modal-app-name yam-openpi \
+  --modal-class-name YamQuicPolicyServer \
+  --modal-server-start-timeout-s 1200 \
+  --prompt "pick up the object and place it in the target area" \
+  --max-steps 1200 \
+  --fps 50 \
+  --action-horizon 50 \
+  --action-playback-fps 10 \
+  --inter-chunk-delay-s 1.0 \
+  --max-arm-step-rad 0.01 \
+  --max-gripper-step 0.01 \
+  --use-gravity-comp \
+  --execute
+```
+
 Run a short bounded execute with an empty workspace only after dry-run returns sane 14D actions:
 
 ```bash
@@ -329,6 +353,24 @@ The decision rule is simple: if Modal echo is already above roughly `150 ms`, th
 latency bottleneck. If public Modal websocket echo is slow but Modal QUIC echo is near `40 ms`, use `--transport
 modal-quic` for robot inference. If both Modal paths are slow, keep Modal for training and serve robot inference on a
 direct GPU host.
+
+## 7. Gripper Data Regression Checks
+
+Before uploading or training on a new dataset, run the end-to-end gripper regression inspector. It compares the archived
+old-good NPZ demos against the current raw demos, checks gripper dims `6` and `13`, and writes JSONL logs under
+`yam_data/logs/data_regression/`.
+
+```bash
+uv run python -m examples.yam_real.data_regression \
+  --old-good-dir yam_data/archive/raw_before_moved_robot_20260525_145623 \
+  --current-raw-dir yam_data/raw \
+  --source-format auto \
+  --strict
+```
+
+The important convention is `0.0=open, 1.0=closed`. The inspector warns on flat gripper action ranges, missing close
+samples, out-of-range gripper values, and camera/frame count mismatches. It can also inspect a specific MCAP or LeRobot
+source by passing the episode path in `--inputs` and selecting `--source-format mcap` or `--source-format lerobot`.
 
 Then run the task with the normal per-step limits:
 
