@@ -66,6 +66,23 @@ def test_linuxpy_camera_accepts_method_frame_sizes_with_fps_intervals(monkeypatc
     assert fake_env.captures[0].format_call == (640, 480, "MJPG")
 
 
+def test_linuxpy_camera_capture_properties_include_actual_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_env = FakeCameraEnv(max_fps=30.0)
+    fake_env.install(monkeypatch)
+
+    config = common.CameraConfig(frame_size=(640, 480), fps=30, pixel_format="MJPG", verify_mode=True)
+    with common.LinuxpyV4L2Camera("cam_high", "/dev/fake", config) as camera:
+        properties = camera.capture_properties()
+
+    assert properties["bus_info"] == "usb-fake"
+    assert properties["driver"] == "fake"
+    assert properties["frame_sizes"][0]["width"] == 640
+    assert properties["actual_fps"] == 30.0
+    assert properties["actual_format"]["width"] == 640
+    assert properties["actual_format"]["height"] == 480
+    assert properties["actual_format"]["pixel_format"] == "MJPG"
+
+
 def test_async_camera_set_returns_latest_frame_without_waiting_for_next_read(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_env = FakeCameraEnv(max_fps=30.0, read_delay_s=0.03)
     fake_env.install(monkeypatch)
@@ -92,6 +109,18 @@ def test_camera_metadata_counts_unique_frames_and_reused_rows() -> None:
 
     np.testing.assert_allclose(timestamps["cam_high"], np.asarray([10.0, 10.05]))
     assert reuse["cam_high"] == {"rows": 3, "unique_frames": 2, "reused_rows": 1, "missing_rows": 0}
+
+
+def test_teleop_pair_unsynced_action_equals_follower_state() -> None:
+    follower = FakeFollower()
+    leader = FakeLeader()
+    pair = record_episode.TeleopPair("left", leader, follower, bilateral_kp=0.2)
+
+    state, action, buttons = pair.step()
+
+    np.testing.assert_allclose(action, state)
+    assert buttons.tolist() == [0.0, 0.0]
+    assert follower.commands == []
 
 
 class FakeCameraEnv:
@@ -162,6 +191,13 @@ class FakeFrameInterval:
         self.max_fps = max_fps
 
 
+class FakeActualFormat:
+    def __init__(self, width: int, height: int, pixel_format: str) -> None:
+        self.width = width
+        self.height = height
+        self.pixel_format = pixel_format
+
+
 class FakeLinuxpy024Info:
     bus_info = "usb-fake"
     card = "FakeCam"
@@ -199,12 +235,20 @@ class FakeDevice:
         self.opened = False
         self.closed = False
         self.frame_index = 0
+        self.actual_format: FakeActualFormat | None = None
+        self.actual_fps: float | None = None
 
     def open(self) -> None:
         self.opened = True
 
     def close(self) -> None:
         self.closed = True
+
+    def get_format(self):
+        return self.actual_format
+
+    def get_fps(self):
+        return self.actual_fps
 
     def __iter__(self):
         while not self.closed:
@@ -223,6 +267,36 @@ class FakeVideoCapture:
 
     def set_format(self, width: int, height: int, pixel_format: str = "MJPG") -> None:
         self.format_call = (width, height, pixel_format)
+        self.device.actual_format = FakeActualFormat(width, height, pixel_format)
 
     def set_fps(self, fps: float) -> None:
         self.fps_call = fps
+        self.device.actual_fps = fps
+
+
+class FakeFollower:
+    def __init__(self) -> None:
+        self.commands: list[np.ndarray] = []
+
+    def get_observations(self) -> dict[str, np.ndarray]:
+        return {
+            "joint_pos": np.asarray([0.1, -0.2, 0.3, -0.4, 0.5, -0.6], dtype=np.float32),
+            "gripper_pos": np.asarray([0.25], dtype=np.float32),
+        }
+
+    def command_joint_pos(self, command: np.ndarray) -> None:
+        self.commands.append(np.asarray(command, dtype=np.float32))
+
+
+class FakeLeader:
+    def get_info(self) -> tuple[np.ndarray, np.ndarray]:
+        return np.zeros((7,), dtype=np.float32), np.zeros((2,), dtype=np.float32)
+
+    def command_arm_pos(self, qpos_6d: np.ndarray) -> None:
+        del qpos_6d
+
+    def set_bilateral(self, *, enabled: bool, gain: float) -> None:
+        del enabled, gain
+
+    def pulse_haptic(self, *, pattern_s: tuple[float, ...], gain: float) -> None:
+        del pattern_s, gain

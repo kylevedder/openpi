@@ -4,9 +4,11 @@ from collections.abc import Callable
 import contextlib
 import dataclasses
 import json
+import multiprocessing as mp
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any, Literal
 
@@ -15,6 +17,7 @@ import numpy as np
 import tyro
 
 from examples.yam_real import common
+from examples.yam_real import process_runtime
 from examples.yam_real import read_yam_encoders
 
 ProbeMode = Literal[
@@ -22,12 +25,18 @@ ProbeMode = Literal[
     "camera-single",
     "camera-all-sequential",
     "camera-grab-retrieve",
+    "mcap-write",
     "image-save",
     "camera-exposure-sweep",
     "can-raw",
     "robot-state",
     "teleop-step-nosync",
     "record-loop-dry",
+    "process-camera",
+    "process-teleop-step",
+    "process-writer",
+    "process-record-loop-dry",
+    "monopi-camera-single",
 ]
 
 DEFAULT_MODES: tuple[ProbeMode, ...] = (
@@ -35,11 +44,14 @@ DEFAULT_MODES: tuple[ProbeMode, ...] = (
     "camera-single",
     "camera-all-sequential",
     "camera-grab-retrieve",
-    "image-save",
-    "can-raw",
+    "mcap-write",
     "robot-state",
     "teleop-step-nosync",
     "record-loop-dry",
+    "process-camera",
+    "process-teleop-step",
+    "process-writer",
+    "process-record-loop-dry",
 )
 
 FIFTY_HZ_BUDGET_MS = 20.0
@@ -74,8 +86,14 @@ class Args:
     exposure_sweep: tuple[float, ...] = (40.0, 80.0, 120.0, 156.0)
     arm: str = "yam"
     gripper: Literal["crank_4310", "linear_3507", "linear_4310"] = "linear_4310"
+    bilateral_kp: float = 0.2
     ee_mass: float | None = None
     use_gravity_comp: bool = False
+    camera_ipc_ring_size: int = 16
+    writer_queue_size: int = 16
+    ipc_startup_timeout_s: float = 10.0
+    ipc_step_timeout_s: float = 2.0
+    writer_drain_timeout_s: float = 10.0
 
 
 def main(args: Args) -> None:
@@ -83,6 +101,16 @@ def main(args: Args) -> None:
         raise ValueError("--duration-s must be positive")
     if args.fps <= 0:
         raise ValueError("--fps must be positive")
+    if args.camera_ipc_ring_size <= 1:
+        raise ValueError("--camera-ipc-ring-size must be greater than 1")
+    if args.writer_queue_size <= 0:
+        raise ValueError("--writer-queue-size must be positive")
+    if args.ipc_startup_timeout_s <= 0:
+        raise ValueError("--ipc-startup-timeout-s must be positive")
+    if args.ipc_step_timeout_s <= 0:
+        raise ValueError("--ipc-step-timeout-s must be positive")
+    if args.writer_drain_timeout_s <= 0:
+        raise ValueError("--writer-drain-timeout-s must be positive")
 
     started_at = time.strftime("%Y%m%d_%H%M%S")
     run_id = f"yam_refresh_rate_{started_at}"
@@ -129,6 +157,8 @@ def _run_mode(mode: ProbeMode, args: Args, scratch_run_dir: Path) -> list[Sample
         return _probe_camera_all_sequential(args)
     if mode == "camera-grab-retrieve":
         return _probe_camera_grab_retrieve(args)
+    if mode == "mcap-write":
+        return _probe_mcap_write(args, scratch_run_dir / "mcap-write")
     if mode == "image-save":
         return _probe_image_save(args, scratch_run_dir / "image-save")
     if mode == "camera-exposure-sweep":
@@ -141,6 +171,16 @@ def _run_mode(mode: ProbeMode, args: Args, scratch_run_dir: Path) -> list[Sample
         return _probe_teleop_step_no_sync(args)
     if mode == "record-loop-dry":
         return _probe_record_loop_dry(args, scratch_run_dir / "record-loop-dry")
+    if mode == "process-camera":
+        return _probe_process_camera(args)
+    if mode == "process-teleop-step":
+        return _probe_process_teleop_step(args)
+    if mode == "process-writer":
+        return _probe_process_writer(args, scratch_run_dir / "process-writer")
+    if mode == "process-record-loop-dry":
+        return _probe_process_record_loop_dry(args, scratch_run_dir / "process-record-loop-dry")
+    if mode == "monopi-camera-single":
+        return _probe_monopi_camera_single(args)
     raise ValueError(f"Unsupported probe mode: {mode}")
 
 
@@ -338,6 +378,82 @@ def _probe_image_save(args: Args, output_dir: Path) -> list[Sample]:
     return samples
 
 
+def _probe_mcap_write(args: Args, output_dir: Path) -> list[Sample]:
+    from examples.yam_real import mcap_episode
+
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=False)
+    frames = _cached_rgb_frames(args)
+    state = np.zeros((14,), dtype=np.float32)
+    action = np.zeros((14,), dtype=np.float32)
+    writer = mcap_episode.YamMcapEpisodeWriter(
+        output_dir,
+        task="refresh-rate mcap write probe",
+        fps=args.fps,
+        camera_fps=args.camera_fps,
+        image_width=args.camera_width,
+        image_height=args.camera_height,
+        camera_config={"probe": "mcap-write", "requested": _camera_config(args).as_manifest()},
+    )
+    samples: list[Sample] = []
+    deadline = time.perf_counter() + args.duration_s
+    sample_index = 0
+    base_timestamp_ns = time.time_ns()
+    try:
+        while time.perf_counter() < deadline and sample_index < args.max_samples_per_mode:
+            timestamp_ns = base_timestamp_ns + int(sample_index * 1_000_000_000 / args.fps)
+            camera_timestamp_ns = base_timestamp_ns + int(sample_index * 1_000_000_000 / args.camera_fps)
+            durations_ms, _outputs = measure_stage_sequence(
+                [
+                    (
+                        "write_step",
+                        lambda timestamp_ns=timestamp_ns, camera_timestamp_ns=camera_timestamp_ns, sample_index=sample_index: writer.write_step(
+                            frames_rgb=frames,
+                            camera_metadata={
+                                camera_name: {
+                                    "sequence_index": sample_index,
+                                    "capture_timestamp_ns": camera_timestamp_ns,
+                                }
+                                for camera_name in common.CAMERA_NAMES
+                            },
+                            state=state,
+                            action=action,
+                            timestamp_ns=timestamp_ns,
+                        ),
+                    )
+                ]
+            )
+            samples.append(
+                _sample(
+                    "mcap-write",
+                    target="cached_rgb",
+                    sample_index=sample_index,
+                    durations_ms=durations_ms,
+                    extra={
+                        "scratch_dir": str(output_dir),
+                        "camera_count": len(frames),
+                        "frame_shapes": {name: list(frame.shape) for name, frame in frames.items()},
+                    },
+                )
+            )
+            sample_index += 1
+    finally:
+        close_start = time.perf_counter()
+        writer.close()
+        if samples:
+            samples.append(
+                _sample(
+                    "mcap-write",
+                    target="close",
+                    sample_index=sample_index,
+                    durations_ms={"close": _elapsed_ms(close_start), "total": _elapsed_ms(close_start)},
+                    extra={"scratch_dir": str(output_dir)},
+                )
+            )
+    return samples
+
+
 def _probe_camera_exposure_sweep(args: Args) -> list[Sample]:
     del args
     return [
@@ -378,10 +494,10 @@ def _probe_can_channel(args: Args, *, role: str, side: str, channel: str) -> lis
         for sample_index in range(args.can_samples):
             durations_ms: dict[str, float] = {}
             total_start = time.perf_counter()
-            for motor_id, motor_type in motor_list:
+            for receive_index, (motor_id, _motor_type) in enumerate(motor_list):
                 start = time.perf_counter()
-                iface.motor_on(motor_id, motor_type)
-                durations_ms[f"motor_{motor_id:02d}"] = _elapsed_ms(start)
+                iface.try_receive_message(timeout=0.001)
+                durations_ms[f"receive_{receive_index:02d}_motor_{motor_id:02d}"] = _elapsed_ms(start)
             durations_ms["total"] = _elapsed_ms(total_start)
             samples.append(
                 _sample(
@@ -389,7 +505,7 @@ def _probe_can_channel(args: Args, *, role: str, side: str, channel: str) -> lis
                     target=f"{role}_{side}",
                     sample_index=sample_index,
                     durations_ms=durations_ms,
-                    extra={"channel": channel, "motor_count": len(motor_list)},
+                    extra={"channel": channel, "motor_count": len(motor_list), "read_only": True, "no_motor_on": True},
                 )
             )
     finally:
@@ -461,13 +577,11 @@ def _probe_record_loop_dry(args: Args, scratch_dir: Path) -> list[Sample]:
             variants = (
                 ("robots_only", True, False, False),
                 ("cameras_only", False, True, False),
-                ("robots_cameras_no_save", True, True, False),
-                ("robots_cameras_scratch_save", True, True, True),
+                ("robots_cameras", True, True, False),
+                ("robots_cameras_mcap_write", True, True, True),
             )
-            for variant_name, include_robots, include_cameras, include_save in variants:
+            for variant_name, include_robots, include_cameras, include_mcap_write in variants:
                 variant_dir = scratch_dir / variant_name
-                if include_save:
-                    _prepare_image_output_dir(variant_dir)
                 samples.extend(
                     _run_record_loop_variant(
                         args,
@@ -477,11 +591,350 @@ def _probe_record_loop_dry(args: Args, scratch_dir: Path) -> list[Sample]:
                         output_dir=variant_dir,
                         include_robots=include_robots,
                         include_cameras=include_cameras,
-                        include_save=include_save,
+                        include_mcap_write=include_mcap_write,
                     )
                 )
     finally:
         _close_robots(robots)
+    return samples
+
+
+def _probe_process_camera(args: Args) -> list[Sample]:
+    ctx = mp.get_context("spawn")
+    cameras = process_runtime.CameraProcessGroup(
+        ctx=ctx,
+        paths=common.CAMERA_PATHS,
+        config=_camera_config(args),
+        ring_size=args.camera_ipc_ring_size,
+        startup_timeout_s=max(args.ipc_startup_timeout_s, args.camera_startup_timeout_s),
+    )
+    samples: list[Sample] = []
+    try:
+        cameras.start()
+        next_sample_t = time.perf_counter()
+        deadline = time.perf_counter() + args.duration_s
+        sample_index = 0
+        while time.perf_counter() < deadline and sample_index < args.max_samples_per_mode:
+            now = time.perf_counter()
+            if now < next_sample_t:
+                time.sleep(min(0.005, next_sample_t - now))
+                continue
+            scheduler_lag_ms = 1000.0 * max(0.0, now - next_sample_t)
+            total_start = time.perf_counter()
+            try:
+                snapshot = cameras.snapshot(max_age_s=args.max_camera_age_s)
+            except process_runtime.WorkerRuntimeError as exc:
+                if "Missing camera frame refs" not in str(exc):
+                    raise
+                time.sleep(0.005)
+                continue
+            durations_ms = {"snapshot_latest": _elapsed_ms(total_start), "total": _elapsed_ms(total_start)}
+            samples.append(
+                _sample(
+                    "process-camera",
+                    target="all",
+                    sample_index=sample_index,
+                    durations_ms=durations_ms,
+                    extra={
+                        "backend": "multiprocessing_shared_memory",
+                        "worker_pids": cameras.process_ids,
+                        "actual_modes": cameras.actual_modes,
+                        "frame_refs": {name: ref.as_payload() for name, ref in snapshot.refs.items()},
+                        "camera_frame_metadata": snapshot.metadata,
+                        "scheduler_lag_ms": scheduler_lag_ms,
+                    },
+                )
+            )
+            sample_index += 1
+            next_sample_t += 1.0 / args.fps
+    finally:
+        cameras.close()
+    return samples
+
+
+def _probe_process_teleop_step(args: Args) -> list[Sample]:
+    ctx = mp.get_context("spawn")
+    teleop = process_runtime.TeleopProcessGroup(
+        ctx=ctx,
+        gripper=args.gripper,
+        bilateral_kp=args.bilateral_kp,
+        ee_mass=args.ee_mass,
+        use_gravity_comp=args.use_gravity_comp,
+        startup_timeout_s=args.ipc_startup_timeout_s,
+    )
+    samples: list[Sample] = []
+    try:
+        teleop.start()
+        deadline = time.perf_counter() + args.duration_s
+        sample_index = 0
+        while time.perf_counter() < deadline and sample_index < args.max_samples_per_mode:
+            total_start = time.perf_counter()
+            steps = teleop.step(timeout_s=args.ipc_step_timeout_s)
+            durations_ms = {"total": _elapsed_ms(total_start)}
+            for side, result in steps.items():
+                durations_ms[f"{side}_ipc_latency"] = result.ipc_latency_ms
+                durations_ms.update({f"{side}_{name}": value for name, value in result.timings_ms.items()})
+                samples.append(
+                    _sample(
+                        "process-teleop-step",
+                        target=side,
+                        sample_index=sample_index,
+                        durations_ms=durations_ms,
+                        extra={
+                            "worker_pids": teleop.process_ids,
+                            "state_shape": list(result.state.shape),
+                            "action_shape": list(result.action.shape),
+                            "buttons": result.buttons.tolist(),
+                            "synchronized": result.synchronized,
+                            "backend": "multiprocessing_pipe",
+                        },
+                    )
+                )
+            sample_index += 1
+    finally:
+        teleop.close()
+    return samples
+
+
+def _probe_process_writer(args: Args, output_dir: Path) -> list[Sample]:
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    ctx = mp.get_context("spawn")
+    frames = _cached_rgb_frames(args)
+    rings: dict[str, process_runtime.SharedCameraRing] = {}
+    writer: process_runtime.WriterProcessClient | None = None
+    samples: list[Sample] = []
+    state = np.zeros((14,), dtype=np.float32)
+    action = np.zeros((14,), dtype=np.float32)
+    base_timestamp_ns = time.time_ns()
+    try:
+        for camera_name, frame in frames.items():
+            rings[camera_name] = process_runtime.SharedCameraRing.create(
+                camera_name=camera_name,
+                ring_size=args.camera_ipc_ring_size,
+                frame_shape=tuple(frame.shape),
+                dtype=str(frame.dtype),
+                lock=ctx.Lock(),
+            )
+
+        writer = process_runtime.WriterProcessClient(
+            ctx=ctx,
+            camera_specs={name: ring.spec for name, ring in rings.items()},
+            queue_size=args.writer_queue_size,
+            startup_timeout_s=args.ipc_startup_timeout_s,
+        )
+        writer.start()
+        writer.start_episode(
+            episode_dir=output_dir,
+            task="refresh-rate process writer probe",
+            fps=args.fps,
+            camera_fps=args.camera_fps,
+            image_width=args.camera_width,
+            image_height=args.camera_height,
+            camera_config={
+                "probe": "process-writer",
+                "requested": _camera_config(args).as_manifest(),
+                "backend": "multiprocessing_shared_memory",
+            },
+            timeout_s=args.writer_drain_timeout_s,
+        )
+        next_write_t = time.perf_counter()
+        deadline = time.perf_counter() + args.duration_s
+        sample_index = 0
+        while time.perf_counter() < deadline and sample_index < args.max_samples_per_mode:
+            now = time.perf_counter()
+            if now < next_write_t:
+                time.sleep(min(0.005, next_write_t - now))
+                continue
+            total_start = time.perf_counter()
+            scheduler_lag_ms = 1000.0 * max(0.0, now - next_write_t)
+            timestamp_ns = base_timestamp_ns + int(sample_index * 1_000_000_000 / args.fps)
+            camera_timestamp_ns = base_timestamp_ns + int(sample_index * 1_000_000_000 / args.camera_fps)
+            refs: dict[str, process_runtime.CameraFrameRef] = {}
+            shm_start = time.perf_counter()
+            for camera_name, frame in frames.items():
+                ref = process_runtime.CameraFrameRef(
+                    camera_name=camera_name,
+                    slot_index=sample_index % args.camera_ipc_ring_size,
+                    sequence_index=sample_index,
+                    capture_timestamp_ns=camera_timestamp_ns,
+                    capture_time_s=camera_timestamp_ns / 1_000_000_000.0,
+                    monotonic_time_s=time.monotonic(),
+                )
+                rings[camera_name].write_frame(ref, frame)
+                refs[camera_name] = ref
+            shm_write_ms = _elapsed_ms(shm_start)
+
+            write_start = time.perf_counter()
+            queue_depth = writer.write_row(
+                frame_index=sample_index,
+                timestamp_ns=timestamp_ns,
+                state=state,
+                action=action,
+                camera_refs=refs,
+                camera_metadata={name: ref.metadata() for name, ref in refs.items()},
+                timeout_s=min(0.01, args.ipc_step_timeout_s),
+            )
+            durations_ms = {
+                "shared_memory_write": shm_write_ms,
+                "writer_enqueue": _elapsed_ms(write_start),
+                "total": _elapsed_ms(total_start),
+            }
+            samples.append(
+                _sample(
+                    "process-writer",
+                    target="cached_rgb",
+                    sample_index=sample_index,
+                    durations_ms=durations_ms,
+                    extra={
+                        "scratch_dir": str(output_dir),
+                        "worker_pid": writer.pid,
+                        "queue_depth": queue_depth,
+                        "accepted_rows": writer.accepted_rows,
+                        "written_rows": writer.written_rows,
+                        "scheduler_lag_ms": scheduler_lag_ms,
+                    },
+                )
+            )
+            sample_index += 1
+            next_write_t += 1.0 / args.fps
+
+        close_start = time.perf_counter()
+        stopped = writer.stop_episode(timeout_s=args.writer_drain_timeout_s)
+        samples.append(
+            _sample(
+                "process-writer",
+                target="drain_close",
+                sample_index=sample_index,
+                durations_ms={"drain_close": _elapsed_ms(close_start), "total": _elapsed_ms(close_start)},
+                extra={"scratch_dir": str(output_dir), **stopped},
+            )
+        )
+    finally:
+        if writer is not None:
+            writer.close()
+        for ring in rings.values():
+            with contextlib.suppress(Exception):
+                ring.close()
+            with contextlib.suppress(Exception):
+                ring.unlink()
+    return samples
+
+
+def _probe_process_record_loop_dry(args: Args, scratch_dir: Path) -> list[Sample]:
+    if scratch_dir.exists():
+        shutil.rmtree(scratch_dir)
+    scratch_dir.mkdir(parents=True, exist_ok=False)
+    runtime = process_runtime.YamMultiprocessRuntime(
+        camera_config=_camera_config(args),
+        gripper=args.gripper,
+        bilateral_kp=args.bilateral_kp,
+        ee_mass=args.ee_mass,
+        use_gravity_comp=args.use_gravity_comp,
+        camera_ring_size=args.camera_ipc_ring_size,
+        writer_queue_size=args.writer_queue_size,
+        startup_timeout_s=max(args.ipc_startup_timeout_s, args.camera_startup_timeout_s),
+        step_timeout_s=args.ipc_step_timeout_s,
+        writer_drain_timeout_s=args.writer_drain_timeout_s,
+    )
+    samples: list[Sample] = []
+    episode_started = False
+    frame_index = 0
+    try:
+        with runtime:
+            runtime.start_episode(
+                episode_dir=scratch_dir,
+                task="refresh-rate process record loop dry run",
+                fps=args.fps,
+                camera_fps=args.camera_fps,
+                image_width=args.camera_width,
+                image_height=args.camera_height,
+                camera_config={
+                    "probe": "process-record-loop-dry",
+                    "requested": _camera_config(args).as_manifest(),
+                    "actual_modes": runtime.camera_actual_modes,
+                    "camera_paths": common.CAMERA_PATHS,
+                    "backend": "multiprocessing",
+                },
+            )
+            episode_started = True
+            record_period_s = 1.0 / args.fps
+            next_record_t = time.perf_counter()
+            deadline = time.perf_counter() + args.duration_s
+            while time.perf_counter() < deadline and frame_index < args.max_samples_per_mode:
+                loop_start = time.perf_counter()
+                durations_ms: dict[str, float] = {}
+                step_start = time.perf_counter()
+                steps = runtime.step_teleop()
+                durations_ms["teleop_ipc_step"] = _elapsed_ms(step_start)
+                for side, result in steps.items():
+                    durations_ms[f"{side}_ipc_latency"] = result.ipc_latency_ms
+                    durations_ms.update({f"{side}_{name}": value for name, value in result.timings_ms.items()})
+
+                now = time.perf_counter()
+                if now < next_record_t:
+                    sleep_s = min(args.record_loop_sleep_s, max(0.0, next_record_t - now))
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    continue
+
+                skipped_periods = 0
+                if now >= next_record_t + record_period_s:
+                    skipped_periods = int((now - next_record_t) // record_period_s)
+                    next_record_t += skipped_periods * record_period_s
+                scheduler_lag_ms = 1000.0 * max(0.0, now - next_record_t)
+                snapshot_start = time.perf_counter()
+                snapshot = runtime.camera_snapshot(max_age_s=args.max_camera_age_s)
+                durations_ms["camera_snapshot"] = _elapsed_ms(snapshot_start)
+                write_start = time.perf_counter()
+                queue_depth = runtime.write_row(
+                    frame_index=frame_index,
+                    timestamp_ns=time.time_ns(),
+                    state=common.pack_bimanual(steps["left"].state, steps["right"].state),
+                    action=common.pack_bimanual(steps["left"].action, steps["right"].action),
+                    camera_snapshot=snapshot,
+                )
+                durations_ms["writer_enqueue"] = _elapsed_ms(write_start)
+                durations_ms["total"] = _elapsed_ms(loop_start)
+                samples.append(
+                    _sample(
+                        "process-record-loop-dry",
+                        target="full",
+                        sample_index=frame_index,
+                        durations_ms=durations_ms,
+                        extra={
+                            "scratch_dir": str(scratch_dir),
+                            "scheduler_lag_ms": scheduler_lag_ms,
+                            "skipped_periods": skipped_periods,
+                            "worker_pids": runtime.process_ids,
+                            "writer_queue_depth": queue_depth,
+                            "synchronized": dict(runtime.teleop.synchronized),
+                            "camera_frame_metadata": snapshot.metadata,
+                        },
+                    )
+                )
+                frame_index += 1
+                next_record_t += record_period_s
+
+            close_start = time.perf_counter()
+            stopped = runtime.stop_episode()
+            episode_started = False
+            samples.append(
+                _sample(
+                    "process-record-loop-dry",
+                    target="drain_close",
+                    sample_index=frame_index,
+                    durations_ms={"drain_close": _elapsed_ms(close_start), "total": _elapsed_ms(close_start)},
+                    extra={"scratch_dir": str(scratch_dir), **stopped},
+                )
+            )
+    finally:
+        if episode_started:
+            with contextlib.suppress(Exception):
+                runtime.stop_episode()
+        runtime.close()
     return samples
 
 
@@ -531,59 +984,85 @@ def _run_record_loop_variant(
     output_dir: Path,
     include_robots: bool,
     include_cameras: bool,
-    include_save: bool,
+    include_mcap_write: bool,
 ) -> list[Sample]:
+    from examples.yam_real import mcap_episode
+
     samples: list[Sample] = []
+    writer = None
+    if include_mcap_write:
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        writer = mcap_episode.YamMcapEpisodeWriter(
+            output_dir,
+            task=f"refresh-rate dry loop {variant_name}",
+            fps=args.fps,
+            camera_fps=args.camera_fps,
+            image_width=args.camera_width,
+            image_height=args.camera_height,
+            camera_config={"probe": "record-loop-dry", "variant": variant_name},
+        )
     next_record_t = time.perf_counter()
     deadline = time.perf_counter() + args.duration_s
     frame_index = 0
-    while time.perf_counter() < deadline and frame_index < args.max_samples_per_mode:
-        loop_start = time.perf_counter()
-        durations_ms: dict[str, float] = {}
-        frames = None
-
-        if include_robots:
-            robot_start = time.perf_counter()
-            _read_all_robot_states(robots)
-            durations_ms["robot_loop"] = _elapsed_ms(robot_start)
-
-        now = time.perf_counter()
-        if now >= next_record_t:
-            scheduler_lag_ms = 1000.0 * max(0.0, now - next_record_t)
+    try:
+        while time.perf_counter() < deadline and frame_index < args.max_samples_per_mode:
+            loop_start = time.perf_counter()
+            durations_ms: dict[str, float] = {}
+            frames = None
             camera_metadata = {}
-            if include_cameras:
-                camera_start = time.perf_counter()
-                snapshot = _record_loop_camera_snapshot(cameras, frame_index, max_age_s=args.max_camera_age_s)
-                frames = snapshot.frames
-                camera_metadata = snapshot.metadata
-                durations_ms["camera_read"] = _elapsed_ms(camera_start)
-            if include_save:
-                if frames is None:
-                    raise RuntimeError("record-loop save variant requires camera frames")
-                save_start = time.perf_counter()
-                _save_frames_for_probe(output_dir, frame_index, frames)
-                durations_ms["image_save"] = _elapsed_ms(save_start)
-            durations_ms["total"] = _elapsed_ms(loop_start)
-            samples.append(
-                _sample(
-                    "record-loop-dry",
-                    target=variant_name,
-                    sample_index=frame_index,
-                    durations_ms=durations_ms,
-                    extra={
-                        "scheduler_lag_ms": scheduler_lag_ms,
-                        "include_robots": include_robots,
-                        "include_cameras": include_cameras,
-                        "include_save": include_save,
-                        "camera_capture_mode": args.record_camera_capture_mode,
-                        "camera_frame_metadata": camera_metadata,
-                    },
-                )
-            )
-            frame_index += 1
-            next_record_t += 1.0 / args.fps
+            state = np.zeros((14,), dtype=np.float32)
+            action = np.zeros((14,), dtype=np.float32)
 
-        time.sleep(0.005)
+            if include_robots:
+                robot_start = time.perf_counter()
+                state, action = _read_all_robot_states(robots)
+                durations_ms["robot_loop"] = _elapsed_ms(robot_start)
+
+            now = time.perf_counter()
+            if now >= next_record_t:
+                scheduler_lag_ms = 1000.0 * max(0.0, now - next_record_t)
+                if include_cameras:
+                    camera_start = time.perf_counter()
+                    snapshot = _record_loop_camera_snapshot(cameras, frame_index, max_age_s=args.max_camera_age_s)
+                    frames = snapshot.frames
+                    camera_metadata = snapshot.metadata
+                    durations_ms["camera_snapshot"] = _elapsed_ms(camera_start)
+                if include_mcap_write:
+                    if frames is None or writer is None:
+                        raise RuntimeError("record-loop MCAP write variant requires camera frames and writer")
+                    write_start = time.perf_counter()
+                    writer.write_step(
+                        camera_snapshot=common.CameraSnapshot(frames=frames, metadata=camera_metadata),
+                        state=state,
+                        action=action,
+                        timestamp_ns=time.time_ns(),
+                    )
+                    durations_ms["mcap_write_step"] = _elapsed_ms(write_start)
+                durations_ms["total"] = _elapsed_ms(loop_start)
+                samples.append(
+                    _sample(
+                        "record-loop-dry",
+                        target=variant_name,
+                        sample_index=frame_index,
+                        durations_ms=durations_ms,
+                        extra={
+                            "scheduler_lag_ms": scheduler_lag_ms,
+                            "include_robots": include_robots,
+                            "include_cameras": include_cameras,
+                            "include_mcap_write": include_mcap_write,
+                            "camera_capture_mode": args.record_camera_capture_mode,
+                            "camera_frame_metadata": camera_metadata,
+                        },
+                    )
+                )
+                frame_index += 1
+                next_record_t += 1.0 / args.fps
+
+            time.sleep(0.005)
+    finally:
+        if writer is not None:
+            writer.close()
     return samples
 
 
@@ -606,11 +1085,13 @@ def _record_loop_camera_snapshot(
     return cameras.snapshot()
 
 
-def _read_all_robot_states(robots: dict[str, Any]) -> None:
-    common.get_follower_state(robots["follower_left"])
-    common.get_follower_state(robots["follower_right"])
+def _read_all_robot_states(robots: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    follower_left = common.get_follower_state(robots["follower_left"])
+    follower_right = common.get_follower_state(robots["follower_right"])
     robots["leader_left"].get_info()
     robots["leader_right"].get_info()
+    state = common.pack_bimanual(follower_left, follower_right)
+    return state, state.copy()
 
 
 def _open_yam_robots(args: Args) -> dict[str, Any]:
@@ -685,6 +1166,115 @@ def _open_camera(name: str, path: str, *, config: common.CameraConfig) -> common
 
 def _read_capture(camera: common.LinuxpyV4L2Camera) -> np.ndarray:
     return camera.read().frame
+
+
+def _cached_rgb_frames(args: Args) -> dict[str, np.ndarray]:
+    height = int(args.camera_height)
+    width = int(args.camera_width)
+    frames = {}
+    for camera_idx, camera_name in enumerate(common.CAMERA_NAMES):
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        image[:, :, 0] = 40 + camera_idx * 50
+        image[:, :, 1] = np.linspace(0, 255, width, dtype=np.uint8)[None, :]
+        image[:, :, 2] = np.linspace(0, 255, height, dtype=np.uint8)[:, None]
+        frames[camera_name] = np.ascontiguousarray(image)
+    return frames
+
+
+def _probe_monopi_camera_single(args: Args) -> list[Sample]:
+    monopi_root = Path("/home/pi-sj/code/monopi")
+    if not monopi_root.exists():
+        return [_error_sample("monopi-camera-single", f"MonoPI checkout not found: {monopi_root}")]
+    if str(monopi_root) not in sys.path:
+        sys.path.insert(0, str(monopi_root))
+
+    try:
+        from monopi.robot.device.camera.v4l2 import v4l2_camera
+        from monopi.robot.device.camera.v4l2 import v4l2_config
+    except Exception as exc:
+        return [_error_sample("monopi-camera-single", f"Could not import MonoPI V4L2 camera: {exc}")]
+
+    samples: list[Sample] = []
+    for camera_name, camera_path in common.CAMERA_PATHS.items():
+        published_frames = []
+        config = v4l2_config.V4L2CameraConfig(
+            name=camera_name,
+            type="V4L2Camera",
+            path=camera_path,
+            frame_size=(args.camera_width, args.camera_height),
+            fps=int(args.camera_fps),
+            pixel_format=args.camera_pixel_format,
+        )
+        camera = v4l2_camera.V4L2Camera(config)
+        camera.set_publisher(published_frames.append)
+        try:
+            camera.start()
+            actual_mode = _monopi_camera_actual_mode(camera)
+            for _ in range(max(0, args.warmup_frames)):
+                _monopi_camera_step(camera, published_frames)
+            deadline = time.perf_counter() + args.duration_s
+            sample_index = 0
+            duplicate_count = 0
+            last_sequence_id = None
+            while time.perf_counter() < deadline and sample_index < args.max_samples_per_mode:
+                durations_ms, outputs = measure_stage_sequence(
+                    [("step", lambda camera=camera, published_frames=published_frames: _monopi_camera_step(camera, published_frames))]
+                )
+                frame = outputs["step"]
+                sequence_id = getattr(frame, "sequence_id", None)
+                duplicate = sequence_id is not None and sequence_id == last_sequence_id
+                if duplicate:
+                    duplicate_count += 1
+                if sequence_id is not None:
+                    last_sequence_id = sequence_id
+                image = camera.fields.image.get(frame) if frame is not None and camera.fields.image is not None else None
+                samples.append(
+                    _sample(
+                        "monopi-camera-single",
+                        target=camera_name,
+                        sample_index=sample_index,
+                        durations_ms=durations_ms,
+                        extra={
+                            "camera_path": camera_path,
+                            "backend": "monopi-v4l2",
+                            "requested_config": dataclasses.asdict(config),
+                            "actual_mode": actual_mode,
+                            "sequence_id": sequence_id,
+                            "capture_timestamp_ns": getattr(frame, "capture_timestamp_ns", None),
+                            "duplicate_count": duplicate_count,
+                            "frame": _frame_stats(image) if image is not None else None,
+                        },
+                    )
+                )
+                sample_index += 1
+        except Exception as exc:
+            samples.append(_error_sample("monopi-camera-single", f"{camera_name}: {exc}", target=camera_name))
+        finally:
+            with contextlib.suppress(Exception):
+                camera.stop()
+    return samples
+
+
+def _monopi_camera_actual_mode(camera: Any) -> dict[str, Any]:
+    device = getattr(camera, "_device", None)
+    if device is None:
+        return {}
+    properties = common.camera_capabilities(device)
+    fmt = common._device_get_format(device)  # noqa: SLF001
+    if fmt is not None:
+        properties["actual_format"] = common._object_public_attrs(fmt)  # noqa: SLF001
+    fps = common._device_get_fps(device)  # noqa: SLF001
+    if fps is not None:
+        properties["actual_fps"] = fps
+    return properties
+
+
+def _monopi_camera_step(camera: Any, published_frames: list[Any]) -> Any | None:
+    before = len(published_frames)
+    camera.step()
+    if len(published_frames) == before:
+        return published_frames[-1] if published_frames else None
+    return published_frames[-1]
 
 
 def _warmup_capture(camera: common.LinuxpyV4L2Camera, warmup_frames: int) -> None:
@@ -874,8 +1464,28 @@ def _build_findings(groups: dict[str, Any], errors: list[Sample]) -> list[dict[s
             }
         )
 
+    mcap_write = _group_total(groups, "mcap-write", "cached_rgb")
+    if mcap_write and mcap_write.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS:
+        findings.append(
+            {
+                "kind": "mcap_write_budget",
+                "severity": "blocker",
+                "message": "Cached RGB to H264 MCAP write_step exceeds the 50 Hz row budget.",
+                "evidence": mcap_write,
+            }
+        )
+    elif mcap_write and mcap_write.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS * 0.5:
+        findings.append(
+            {
+                "kind": "mcap_write_significant",
+                "severity": "warning",
+                "message": "Cached RGB to H264 MCAP write_step consumes more than half of the 50 Hz row budget.",
+                "evidence": mcap_write,
+            }
+        )
+
     for group in groups.values():
-        if group["mode"] not in {"robot-state", "teleop-step-nosync", "can-raw"}:
+        if group["mode"] not in {"robot-state", "teleop-step-nosync", "process-teleop-step", "can-raw"}:
             continue
         total = group["total"]
         if total.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS * 0.5:
@@ -888,27 +1498,53 @@ def _build_findings(groups: dict[str, Any], errors: list[Sample]) -> list[dict[s
                 }
             )
 
-    no_save = _group_total(groups, "record-loop-dry", "robots_cameras_no_save")
-    with_save = _group_total(groups, "record-loop-dry", "robots_cameras_scratch_save")
-    if no_save and with_save:
-        if no_save.get("p95_ms", 0.0) <= FIFTY_HZ_BUDGET_MS and with_save.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS:
+    no_write = _group_total(groups, "record-loop-dry", "robots_cameras") or _group_total(
+        groups, "record-loop-dry", "robots_cameras_no_save"
+    )
+    with_write = _group_total(groups, "record-loop-dry", "robots_cameras_mcap_write") or _group_total(
+        groups, "record-loop-dry", "robots_cameras_scratch_save"
+    )
+    if no_write and with_write:
+        if no_write.get("p95_ms", 0.0) <= FIFTY_HZ_BUDGET_MS and with_write.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS:
             findings.append(
                 {
-                    "kind": "record_loop_save_delta",
+                    "kind": "record_loop_mcap_write_delta",
                     "severity": "blocker",
-                    "message": "Record loop only misses 50 Hz when scratch image saving is enabled; current JPEG recording is likely the bottleneck.",
-                    "evidence": {"without_save": no_save, "with_save": with_save},
+                    "message": "Record loop only misses 50 Hz when MCAP write_step is enabled; H264 MCAP writing is likely the bottleneck.",
+                    "evidence": {"without_mcap_write": no_write, "with_mcap_write": with_write},
                 }
             )
-        elif no_save.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS:
+        elif no_write.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS:
             findings.append(
                 {
                     "kind": "record_loop_combined_no_save",
                     "severity": "blocker",
-                    "message": "Combined robot+camera record loop misses 50 Hz even without saving; suspect capture contention or scheduling.",
-                    "evidence": no_save,
+                    "message": "Combined robot+camera record loop misses 50 Hz even without MCAP writing; suspect capture contention or scheduling.",
+                    "evidence": no_write,
                 }
             )
+
+    process_writer = _group_total(groups, "process-writer", "cached_rgb")
+    if process_writer and process_writer.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS * 0.5:
+        findings.append(
+            {
+                "kind": "process_writer_enqueue_budget",
+                "severity": "warning",
+                "message": "Multiprocessing writer enqueue consumes significant 50 Hz budget.",
+                "evidence": process_writer,
+            }
+        )
+
+    process_record_loop = _group_total(groups, "process-record-loop-dry", "full")
+    if process_record_loop and process_record_loop.get("p95_ms", 0.0) > FIFTY_HZ_BUDGET_MS:
+        findings.append(
+            {
+                "kind": "process_record_loop_budget",
+                "severity": "blocker",
+                "message": "Full multiprocessing dry record loop misses the 50 Hz row budget.",
+                "evidence": process_record_loop,
+            }
+        )
     return findings
 
 

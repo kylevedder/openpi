@@ -253,14 +253,15 @@ class LinuxpyV4L2Camera:
                 "bus_info": getattr(info, "bus_info", ""),
                 "card": getattr(info, "card", ""),
                 "driver": getattr(info, "driver", ""),
-                "frame_sizes": _frame_sizes_as_dicts(getattr(info, "frame_sizes", ())),
+                "frame_sizes": _frame_sizes_as_dicts(info),
             }
         )
-        with contextlib.suppress(Exception):
-            fmt = self._device.get_format()
+        fmt = _device_get_format(self._device)
+        if fmt is not None:
             properties["actual_format"] = _object_public_attrs(fmt)
-        with contextlib.suppress(Exception):
-            properties["actual_fps"] = float(self._device.get_fps())
+        fps = _device_get_fps(self._device)
+        if fps is not None:
+            properties["actual_fps"] = fps
         return properties
 
     def close(self) -> None:
@@ -592,6 +593,30 @@ def _pixel_formats_match(actual: Any, requested: str) -> bool:
     return actual_normalized in aliases.get(requested_normalized, {requested_normalized})
 
 
+def _device_get_format(device: Any) -> Any | None:
+    get_format = getattr(device, "get_format", None)
+    if get_format is None:
+        return None
+    buffer_type = getattr(getattr(video_device, "BufferType", None), "VIDEO_CAPTURE", None)
+    arg_options = ((buffer_type,), ()) if buffer_type is not None else ((),)
+    for args in arg_options:
+        with contextlib.suppress(Exception):
+            return get_format(*args)
+    return None
+
+
+def _device_get_fps(device: Any) -> float | None:
+    get_fps = getattr(device, "get_fps", None)
+    if get_fps is None:
+        return None
+    buffer_type = getattr(getattr(video_device, "BufferType", None), "VIDEO_CAPTURE", None)
+    arg_options = ((buffer_type,), ()) if buffer_type is not None else ((),)
+    for args in arg_options:
+        with contextlib.suppress(Exception):
+            return float(get_fps(*args))
+    return None
+
+
 def _object_public_attrs(value: Any) -> dict[str, Any]:
     attrs = {}
     for name in dir(value):
@@ -601,9 +626,25 @@ def _object_public_attrs(value: Any) -> dict[str, Any]:
             attr = getattr(value, name)
         except Exception:
             continue
-        if isinstance(attr, str | int | float | bool | tuple | list):
-            attrs[name] = attr
+        encoded = _jsonable_camera_property(attr)
+        if encoded is not None:
+            attrs[name] = encoded
     return attrs
+
+
+def _jsonable_camera_property(value: Any) -> Any | None:
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    if isinstance(value, tuple | list):
+        return [_jsonable_camera_property(item) for item in value]
+    name = getattr(value, "name", None)
+    if name:
+        return str(name)
+    human_str = getattr(value, "human_str", None)
+    if callable(human_str):
+        with contextlib.suppress(Exception):
+            return str(human_str())
+    return None
 
 
 def make_episode_dir(root: Path, name: str | None = None) -> Path:

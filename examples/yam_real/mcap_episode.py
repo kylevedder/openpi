@@ -59,6 +59,7 @@ class YamMcapEpisode:
     action: np.ndarray
     images: dict[str, np.ndarray] | None = None
     camera_timestamps_ns: dict[str, np.ndarray] | None = None
+    camera_row_timestamps_ns: dict[str, np.ndarray] | None = None
     camera_frame_reuse: dict[str, dict[str, int]] | None = None
 
 
@@ -417,6 +418,9 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
         action=action_array,
         images=image_arrays,
         camera_timestamps_ns=camera_timestamps_ns,
+        camera_row_timestamps_ns={
+            camera_name: np.asarray(values, dtype=np.int64) for camera_name, values in camera_row_timestamps.items()
+        },
         camera_frame_reuse={
             camera_name: {
                 "rows": len(values),

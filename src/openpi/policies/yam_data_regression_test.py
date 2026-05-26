@@ -11,6 +11,7 @@ from examples.yam_real import convert_yam_data_to_lerobot
 from examples.yam_real import data_regression
 from examples.yam_real import mcap_episode
 from examples.yam_real import read_yam_encoders
+from examples.yam_real import validate_yam_recording
 from openpi import transforms
 from openpi.policies import yam_policy
 from openpi.shared import jpeg_transport
@@ -110,6 +111,55 @@ def test_mcap_rows_can_reuse_latest_30hz_camera_frame(tmp_path: Path) -> None:
         "missing_rows": 0,
     }
     np.testing.assert_array_equal(actual.camera_timestamps_ns["cam_high"], np.asarray([0, 33_333_333, 66_666_666]))
+
+
+def test_validate_yam_recording_accepts_synthetic_50hz_rows_30hz_cameras(tmp_path: Path) -> None:
+    episode = data_regression.make_synthetic_episode(num_frames=50)
+    episode_dir = _write_mcap_fixture_with_50hz_rows_30hz_cameras(episode, tmp_path / "00_static_unsynced")
+
+    summary = validate_yam_recording.validate_episode(
+        validate_yam_recording.Args(
+            episode_dir=episode_dir,
+            expected_row_fps=50.0,
+            expected_camera_fps=30.0,
+            strict=True,
+            output_dir=tmp_path / "validation",
+        )
+    )
+
+    assert summary["strict_pass"]
+    assert summary["camera_frame_reuse"]["cam_high"]["unique_frames"] == 30
+    assert summary["camera_frame_reuse"]["cam_high"]["reused_rows"] == 20
+    assert summary["images"]["cam_high"]["blank_frames"] == 0
+    assert (tmp_path / "validation" / "00_static_unsynced" / "contact_sheet.jpg").is_file()
+
+
+def test_validate_yam_recording_rejects_row_timing_mismatch(tmp_path: Path) -> None:
+    episode = data_regression.make_synthetic_episode(num_frames=12)
+    bad_episode = data_regression.CanonicalEpisode(
+        source_path=episode.source_path,
+        source_format=episode.source_format,
+        task=episode.task,
+        fps=50.0,
+        state=episode.state,
+        action=episode.action,
+        timestamps_s=np.arange(episode.num_frames, dtype=np.float64) * 0.06,
+        image_counts=episode.image_counts,
+    )
+    episode_dir = _write_mcap_fixture_with_50hz_rows_30hz_cameras(bad_episode, tmp_path / "bad_timing")
+
+    summary = validate_yam_recording.validate_episode(
+        validate_yam_recording.Args(
+            episode_dir=episode_dir,
+            expected_row_fps=50.0,
+            expected_camera_fps=30.0,
+            strict=True,
+            output_dir=tmp_path / "validation",
+        )
+    )
+
+    assert not summary["strict_pass"]
+    assert any("row median dt" in failure for failure in summary["strict_failures"])
 
 
 def test_mcap_decode_preserves_rgb_channel_order(tmp_path: Path) -> None:
@@ -503,6 +553,65 @@ def _write_mcap_fixture_with_rgb_values(
     finally:
         writer.close()
     return episode_dir
+
+
+def _write_mcap_fixture_with_50hz_rows_30hz_cameras(
+    episode: data_regression.CanonicalEpisode,
+    episode_dir: Path,
+) -> Path:
+    writer = mcap_episode.YamMcapEpisodeWriter(
+        episode_dir,
+        task=episode.task,
+        fps=episode.fps,
+        camera_fps=30.0,
+        camera_config={
+            "requested": {"frame_size": [640, 480], "fps": 30, "pixel_format": "MJPG"},
+            "actual_modes": {
+                camera_name: {
+                    "actual_fps": 30.0,
+                    "actual_format": {"width": 640, "height": 480, "pixel_format": "MJPG"},
+                    "driver": "fixture",
+                    "bus_info": "fixture",
+                }
+                for camera_name in data_regression.CAMERA_NAMES
+            },
+            "camera_paths": {camera_name: f"/dev/null/{camera_name}" for camera_name in data_regression.CAMERA_NAMES},
+        },
+    )
+    try:
+        for frame_idx in range(episode.num_frames):
+            row_timestamp_ns = int(episode.timestamps_s[frame_idx] * 1_000_000_000)
+            camera_sequence = int(np.floor(episode.timestamps_s[frame_idx] * 30.0 + 1e-9))
+            camera_timestamp_ns = int(camera_sequence * 1_000_000_000 / 30.0)
+            frames = {
+                camera_name: _gradient_frame(camera_sequence, camera_idx)
+                for camera_idx, camera_name in enumerate(data_regression.CAMERA_NAMES)
+            }
+            writer.write_step(
+                frames_rgb=frames,
+                camera_metadata={
+                    camera_name: {
+                        "sequence_index": camera_sequence,
+                        "capture_timestamp_ns": camera_timestamp_ns,
+                        "capture_time_s": camera_timestamp_ns / 1_000_000_000.0,
+                    }
+                    for camera_name in data_regression.CAMERA_NAMES
+                },
+                state=episode.state[frame_idx],
+                action=episode.action[frame_idx],
+                timestamp_ns=row_timestamp_ns,
+            )
+    finally:
+        writer.close()
+    return episode_dir
+
+
+def _gradient_frame(sequence_id: int, camera_idx: int) -> np.ndarray:
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    image[:, :, 0] = (sequence_id * 3 + camera_idx * 40) % 255
+    image[:, :, 1] = np.linspace(0, 255, 640, dtype=np.uint8)[None, :]
+    image[:, :, 2] = np.linspace(0, 255, 480, dtype=np.uint8)[:, None]
+    return np.ascontiguousarray(image)
 
 
 def _snapshot_refs(sequence_id: int = 1) -> dict[mcap_episode.pistream_mcap.FieldKey, mcap_episode.FieldValueRef]:

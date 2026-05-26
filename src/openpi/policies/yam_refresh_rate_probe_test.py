@@ -1,10 +1,14 @@
+import multiprocessing as mp
 from pathlib import Path
 import sys
 
+import numpy as np
 import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[3]))
 
+from examples.yam_real import process_runtime
+from examples.yam_real import record_episode
 from examples.yam_real import refresh_rate_probe
 
 
@@ -86,16 +90,125 @@ def test_analyzer_flags_image_save_when_camera_reads_are_fast() -> None:
 
 def test_analyzer_flags_record_loop_save_delta() -> None:
     samples = [
-        _sample("record-loop-dry", "robots_cameras_no_save", 14.0),
-        _sample("record-loop-dry", "robots_cameras_no_save", 15.0),
-        _sample("record-loop-dry", "robots_cameras_scratch_save", 34.0),
-        _sample("record-loop-dry", "robots_cameras_scratch_save", 36.0),
+        _sample("record-loop-dry", "robots_cameras", 14.0),
+        _sample("record-loop-dry", "robots_cameras", 15.0),
+        _sample("record-loop-dry", "robots_cameras_mcap_write", 34.0),
+        _sample("record-loop-dry", "robots_cameras_mcap_write", 36.0),
     ]
 
     summary = refresh_rate_probe.analyze_samples(samples, fps=50.0)
 
-    assert summary["dominant_bottleneck"] == "record_loop_save_delta"
-    assert any(finding["kind"] == "record_loop_save_delta" for finding in summary["findings"])
+    assert summary["dominant_bottleneck"] == "record_loop_mcap_write_delta"
+    assert any(finding["kind"] == "record_loop_mcap_write_delta" for finding in summary["findings"])
+
+
+def test_analyzer_flags_process_record_loop_budget() -> None:
+    samples = [
+        _sample("process-record-loop-dry", "full", 24.0),
+        _sample("process-record-loop-dry", "full", 28.0),
+    ]
+
+    summary = refresh_rate_probe.analyze_samples(samples, fps=50.0)
+
+    assert summary["dominant_bottleneck"] == "process_record_loop_budget"
+    assert any(finding["kind"] == "process_record_loop_budget" for finding in summary["findings"])
+
+
+def test_recorder_diagnostics_classifies_synthetic_loop_bottleneck() -> None:
+    records = [
+        {
+            "type": "loop",
+            "recorded": True,
+            "timestamp_ns": 1_000_000_000,
+            "durations_ms": {"left_teleop_step": 4.0, "mcap_write_step": 6.0, "total_loop": 18.0},
+        },
+        {
+            "type": "loop",
+            "recorded": True,
+            "timestamp_ns": 1_020_000_000,
+            "durations_ms": {"left_teleop_step": 5.0, "mcap_write_step": 32.0, "total_loop": 42.0},
+        },
+    ]
+
+    summary = record_episode.RecorderDiagnostics.summarize_records(records, fps=50.0)
+
+    assert summary["recorded_rows"] == 2
+    assert summary["row_fps"] == 50.0
+    assert summary["bottleneck"].startswith("mcap_write_step")
+
+
+def test_mcap_write_probe_writes_only_to_scratch_dir(tmp_path: Path) -> None:
+    output_dir = tmp_path / "scratch" / "mcap-write"
+    args = refresh_rate_probe.Args(
+        duration_s=0.01,
+        max_samples_per_mode=2,
+        camera_width=64,
+        camera_height=48,
+        fps=50.0,
+        camera_fps=30.0,
+    )
+
+    samples = refresh_rate_probe._probe_mcap_write(args, output_dir)  # noqa: SLF001
+
+    assert any(sample["mode"] == "mcap-write" and sample["target"] == "cached_rgb" for sample in samples)
+    assert output_dir.is_dir()
+    assert all(path.is_relative_to(output_dir) for path in output_dir.rglob("*"))
+    assert any(path.name.startswith("episode_part") for path in output_dir.iterdir())
+
+
+def test_shared_camera_ring_detects_overwritten_slot() -> None:
+    ctx = mp.get_context("spawn")
+    ring = process_runtime.SharedCameraRing.create(
+        camera_name="cam_high",
+        ring_size=2,
+        frame_shape=(4, 4, 3),
+        dtype="uint8",
+        lock=ctx.Lock(),
+    )
+    try:
+        first_ref = process_runtime.CameraFrameRef(
+            camera_name="cam_high",
+            slot_index=0,
+            sequence_index=0,
+            capture_timestamp_ns=1,
+            capture_time_s=0.0,
+            monotonic_time_s=0.0,
+        )
+        second_ref = process_runtime.CameraFrameRef(
+            camera_name="cam_high",
+            slot_index=0,
+            sequence_index=2,
+            capture_timestamp_ns=2,
+            capture_time_s=0.0,
+            monotonic_time_s=0.0,
+        )
+        ring.write_frame(first_ref, np.ones((4, 4, 3), dtype=np.uint8))
+        ring.write_frame(second_ref, np.zeros((4, 4, 3), dtype=np.uint8))
+
+        with pytest.raises(RuntimeError, match="slot overwritten"):
+            ring.read_frame(first_ref)
+    finally:
+        ring.close()
+        ring.unlink()
+
+
+def test_process_writer_probe_writes_only_to_scratch_dir(tmp_path: Path) -> None:
+    output_dir = tmp_path / "scratch" / "process-writer"
+    args = refresh_rate_probe.Args(
+        duration_s=0.01,
+        max_samples_per_mode=2,
+        camera_width=64,
+        camera_height=48,
+        fps=50.0,
+        camera_fps=30.0,
+    )
+
+    samples = refresh_rate_probe._probe_process_writer(args, output_dir)  # noqa: SLF001
+
+    assert any(sample["mode"] == "process-writer" and sample["target"] == "cached_rgb" for sample in samples)
+    assert output_dir.is_dir()
+    assert all(path.is_relative_to(output_dir) for path in output_dir.rglob("*"))
+    assert any(path.name.startswith("episode_part") for path in output_dir.iterdir())
 
 
 def _sample(mode: str, target: str, total_ms: float) -> dict:
