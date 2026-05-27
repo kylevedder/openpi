@@ -9,9 +9,6 @@ from examples.yam_real import common
 
 SYNC_BUTTON_INDEX = 0
 RECORD_BUTTON_INDEX = 1
-STATUS_CUE_START_PATTERN = (0.12,)
-STATUS_CUE_STOP_PATTERN = (0.06, 0.06)
-STATUS_CUE_GAP_S = 0.06
 
 
 class YamLeader:
@@ -42,19 +39,6 @@ class YamLeader:
     def current_arm_pos(self) -> np.ndarray:
         return np.asarray(self.robot.get_observations()["joint_pos"], dtype=np.float32)
 
-    def pulse_haptic(self, *, pattern_s: tuple[float, ...], gain: float) -> None:
-        qpos = self.current_arm_pos()
-        kp = self._nominal_kp * gain
-        kd = self._nominal_kd * gain
-        zero_k = np.zeros_like(kp)
-        for duration_s in pattern_s:
-            self.robot.update_kp_kd(kp=kp, kd=kd)
-            self.command_arm_pos(qpos)
-            time.sleep(duration_s)
-            self.robot.update_kp_kd(kp=zero_k, kd=zero_k)
-            self.command_arm_pos(qpos)
-            time.sleep(STATUS_CUE_GAP_S)
-
 
 class TeleopPair:
     def __init__(self, side: str, leader: YamLeader, follower: Any, bilateral_kp: float) -> None:
@@ -77,13 +61,13 @@ class TeleopPair:
         leader_i2rt, buttons = self.leader.get_info()
         timings_ms["leader_get_info"] = _elapsed_ms(leader_start)
         follower_start = time.perf_counter()
-        follower_openpi = common.get_follower_state(self.follower)
+        follower_monopi = common.get_follower_state(self.follower)
         timings_ms["follower_get_state"] = _elapsed_ms(follower_start)
         button = float(buttons[SYNC_BUTTON_INDEX]) if buttons.size > SYNC_BUTTON_INDEX else 0.0
 
         if button > 0.5 and self._last_button <= 0.5:
             sync_start = time.perf_counter()
-            self._toggle_sync(leader_i2rt, follower_openpi)
+            self._toggle_sync(leader_i2rt, follower_monopi)
             timings_ms["sync_toggle"] = _elapsed_ms(sync_start)
         self._last_button = button
 
@@ -92,30 +76,25 @@ class TeleopPair:
             self.follower.command_joint_pos(leader_i2rt)
             timings_ms["follower_command_joint_pos"] = _elapsed_ms(follower_command_start)
             leader_command_start = time.perf_counter()
-            self.leader.command_arm_pos(follower_openpi[:6])
+            self.leader.command_arm_pos(follower_monopi[:6])
             timings_ms["leader_command_arm_pos"] = _elapsed_ms(leader_command_start)
-            self._last_command = common.i2rt_arm_state_to_openpi(leader_i2rt)
+            self._last_command = common.i2rt_arm_state_to_monopi(leader_i2rt)
         else:
-            self._last_command = follower_openpi
+            self._last_command = follower_monopi
 
         timings_ms["total"] = _elapsed_ms(total_start)
-        return follower_openpi, self._last_command, buttons, timings_ms
+        return follower_monopi, self._last_command, buttons, timings_ms
 
     def close(self) -> None:
         self.leader.set_bilateral(enabled=False, gain=self.bilateral_kp)
 
-    def emit_recording_status(self, *, recording: bool, gain: float) -> None:
-        pattern = STATUS_CUE_START_PATTERN if recording else STATUS_CUE_STOP_PATTERN
-        self.leader.pulse_haptic(pattern_s=pattern, gain=gain)
-        self.leader.set_bilateral(enabled=self.synchronized, gain=self.bilateral_kp)
-
-    def _toggle_sync(self, leader_i2rt: np.ndarray, follower_openpi: np.ndarray) -> None:
+    def _toggle_sync(self, leader_i2rt: np.ndarray, follower_monopi: np.ndarray) -> None:
         self.synchronized = not self.synchronized
         if self.synchronized:
             print(f"[{self.side}] sync enabled", flush=True)
             self.leader.set_bilateral(enabled=True, gain=self.bilateral_kp)
             self.leader.command_arm_pos(leader_i2rt[:6])
-            self._slow_move_follower(common.openpi_arm_state_to_i2rt(follower_openpi), leader_i2rt)
+            self._slow_move_follower(common.monopi_arm_state_to_i2rt(follower_monopi), leader_i2rt)
         else:
             print(f"[{self.side}] sync disabled", flush=True)
             self.leader.set_bilateral(enabled=False, gain=self.bilateral_kp)

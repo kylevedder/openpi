@@ -16,17 +16,17 @@ can_follower_r
 /dev/yam/cam_right_wrist
 ```
 
-The OpenPI observation/action order is:
+The canonical MonoPI YAM observation/action order is:
 
 ```text
 [left_waist, left_shoulder, left_elbow, left_forearm_roll, left_wrist_angle, left_wrist_rotate, left_gripper,
  right_waist, right_shoulder, right_elbow, right_forearm_roll, right_wrist_angle, right_wrist_rotate, right_gripper]
 ```
 
-This matches the PI/ARX bimanual action-space slots: left arm joints, left gripper, right arm joints, right gripper.
-Left and right follow OpenPI's robot convention: viewed from behind the robot looking toward the workspace.
-YAM/i2rt linear grippers report `0.0=closed, 1.0=open`; this example converts at the hardware boundary so all OpenPI
-data and policy actions use `0.0=open, 1.0=closed`.
+This matches the MonoPI `arx_follow_1` / `arx_follow_2` bimanual slots: left arm joints, left gripper, right arm
+joints, right gripper. Left and right are viewed from behind the robot looking toward the workspace.
+YAM/i2rt linear grippers report `0.0=closed, 1.0=open`; this example converts at the hardware boundary so recorded data
+and policy actions use canonical MonoPI YAM state, `0.0=open, 1.0=closed`.
 
 ## 0. Hardware Readout
 
@@ -41,6 +41,18 @@ the motor zero is wrong. If the encoder reports a large angle, software can see 
 
 The recorder defaults to gravity compensation on, 50 Hz robot/action rows, and 30 Hz MJPG camera capture at 640x480.
 Disable gravity compensation for recording with `--no-use-gravity-comp` if you need to debug torque behavior.
+
+Move both followers home and open the grippers:
+
+```bash
+uv run python -m examples.yam_real.move_home \
+  --execute \
+  --side both \
+  --duration-s 5 \
+  --hold-s 1 \
+  --gripper-target open \
+  --use-gravity-comp
+```
 
 ## 1. Record One Teleop Episode
 
@@ -62,9 +74,6 @@ Controls:
 - Repeat start/stop to record back-to-back episodes without restarting the robot process.
 - Press `q` to save any active recording and exit.
 
-Recording status is also echoed on the leader arms as a haptic cue: one short pulse means recording started; two short
-pulses means recording stopped. Disable this with `--no-status-haptic-cue` if it is distracting.
-
 The recorder writes:
 
 ```text
@@ -73,6 +82,9 @@ yam_data/raw/<episode_name>/
   episode_part1.mcap
   episode_part2.mcap
   episode_part3.mcap
+  episode_metadata.json
+  recording_context.json
+yam_data/logs/record_episode/record_episode_<timestamp>.jsonl
 ```
 
 ## 2. Replay the Recorded Actions
@@ -112,7 +124,7 @@ uv run python -m examples.yam_real.convert_yam_data_to_lerobot \
   --repo-id local/yam_bimanual
 ```
 
-The converter defaults to auto-detecting MCAP raw episodes and LeRobot image-frame output. It writes
+The converter accepts canonical MonoPI PiStream MCAP episodes and writes LeRobot image-frame output. It writes
 `conversion_summary.jsonl` in the dataset root with row counts, row FPS, inferred camera FPS, camera-frame reuse, and
 warnings. The OpenPI configs `pi05_yam_bimanual_50hz` and `pi05_yam_bimanual_50hz_jpeg_q85` expect this repo id by
 default.
@@ -137,18 +149,28 @@ On the initial 80-observation sample, raw msgpack was about `452 KB` per request
 are already stored as camera JPEGs; this transport adds the matched post-resize network JPEG artifact that the model sees
 during serving.
 
-## 4. Modal GPU Training
+## 4. Modal Preprocessing and GPU Training
 
 Install and authenticate Modal locally, then run:
 
 ```bash
-uv pip install modal
-modal volume create yam-openpi
-modal volume put yam-openpi ~/.cache/huggingface/lerobot/local/yam_bimanual /lerobot/local/yam_bimanual -f
-modal run examples/yam_real/modal_app.py::compute_norm_stats --config-name pi05_yam_bimanual_50hz_jpeg_q85
-modal run examples/yam_real/modal_app.py::train_fsdp2 \
+uvx --from modal modal volume create yam-openpi
+uvx --from modal modal volume put yam-openpi /home/pi-sj/code/openpi/yam_data/raw /raw/yam_data/raw -f
+uvx --from modal modal volume put yam-openpi /home/pi-sj/code/openpi/yam_data/manifests /raw/yam_data/manifests -f
+uvx --from modal modal run examples/yam_real/modal_app.py::preprocess_yam_mcap_to_lerobot \
+  --raw-dir /mnt/yam/raw/yam_data/raw \
+  --episode-manifest /mnt/yam/raw/yam_data/manifests/pi05_yam_bimanual_50hz_24demo.txt \
+  --repo-id local/yam_bimanual \
+  --mode image \
+  --episode-processes 8 \
+  --scratch-dir /tmp/yam_lerobot_preprocess \
+  --profile-jsonl /tmp/yam_lerobot_preprocess/profile.jsonl \
+  --overwrite
+uvx --from modal modal run examples/yam_real/modal_app.py::compute_norm_stats \
+  --config-name pi05_yam_bimanual_50hz_jpeg_q85
+uvx --from modal modal run examples/yam_real/modal_app.py::train_fsdp2 \
   --config-name pi05_yam_bimanual_50hz_jpeg_q85 \
-  --exp-name yam_bimanual_50hz_jpeg_q85_20demo_v1 \
+  --exp-name yam_bimanual_50hz_jpeg_q85_24demo_20260526_v1 \
   --num-train-steps 1000 \
   --batch-size 8 \
   --overwrite
@@ -158,17 +180,17 @@ Use the short run first to validate the pipeline. For a real run over the full 2
 `--num-train-steps 100`:
 
 ```bash
-modal run --detach examples/yam_real/modal_app.py::train_fsdp2 \
+uvx --from modal modal run --detach examples/yam_real/modal_app.py::train_fsdp2 \
   --config-name pi05_yam_bimanual_50hz_jpeg_q85 \
-  --exp-name yam_bimanual_50hz_jpeg_q85_20demo_v1 \
+  --exp-name yam_bimanual_50hz_jpeg_q85_24demo_20260526_v1 \
   --batch-size 8
 ```
 
 The Modal serving entrypoint is configured to serve checkpoint step `999` from
-`yam_bimanual_50hz_jpeg_q85_20demo_v1`.
+`yam_bimanual_50hz_jpeg_q85_24demo_20260526_v1`.
 
 ```bash
-modal deploy examples/yam_real/modal_app.py
+uvx --from modal modal deploy examples/yam_real/modal_app.py
 ```
 
 The `serve_policy` endpoint runs OpenPI's websocket policy server on port `8000` inside Modal.
@@ -359,15 +381,13 @@ direct GPU host.
 
 ## 7. Gripper Data Regression Checks
 
-Before uploading or training on a new dataset, run the end-to-end gripper regression inspector. It compares the archived
-old-good NPZ demos against the current raw demos, checks gripper dims `6` and `13`, and writes JSONL logs under
-`yam_data/logs/data_regression/`.
+Before uploading or training on a new dataset, run the end-to-end gripper regression inspector. It checks canonical MCAP
+state/action dims `6` and `13`, and writes JSONL logs under `yam_data/logs/data_regression/`.
 
 ```bash
 uv run python -m examples.yam_real.data_regression \
-  --old-good-dir yam_data/archive/raw_before_moved_robot_20260525_145623 \
   --current-raw-dir yam_data/raw \
-  --source-format auto \
+  --source-format mcap \
   --strict
 ```
 

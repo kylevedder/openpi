@@ -12,6 +12,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3]))
 from examples.yam_real import convert_yam_data_to_lerobot
 from examples.yam_real import data_regression
 from examples.yam_real import mcap_episode
+from examples.yam_real import modal_app
 from examples.yam_real import read_yam_encoders
 from examples.yam_real import validate_yam_recording
 from openpi import transforms
@@ -25,11 +26,11 @@ from openpi.training import config as training_config
 def test_yam_gripper_conversion_is_exactly_one_flip() -> None:
     i2rt = np.asarray([0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.2], dtype=np.float32)
 
-    openpi = yam_policy.i2rt_arm_state_to_openpi(i2rt)
+    monopi = yam_policy.i2rt_arm_state_to_monopi(i2rt)
 
-    np.testing.assert_allclose(openpi[:6], i2rt[:6])
-    assert openpi[6] == np.float32(0.8)
-    np.testing.assert_allclose(yam_policy.openpi_arm_state_to_i2rt(openpi), i2rt)
+    np.testing.assert_allclose(monopi[:6], i2rt[:6])
+    assert monopi[6] == np.float32(0.8)
+    np.testing.assert_allclose(yam_policy.monopi_arm_state_to_i2rt(monopi), i2rt)
 
 
 def test_yam_delta_action_mask_keeps_grippers_absolute() -> None:
@@ -150,7 +151,7 @@ def test_mcap_reader_rejects_pre_cutover_episode_without_sidecar(tmp_path: Path)
     (episode_dir / mcap_episode.EPISODE_METADATA_FILENAME).unlink()
 
     assert not mcap_episode.is_mcap_episode(episode_dir)
-    with pytest.raises(RuntimeError, match="Pre-cutover OpenPI/YAM MCAP episodes are unsupported"):
+    with pytest.raises(RuntimeError, match="Only canonical MonoPI PiStream YAM MCAP episodes are supported"):
         mcap_episode.read_episode(episode_dir, decode_images=False)
 
 
@@ -396,23 +397,6 @@ def test_mcap_snapshot_validation_reports_missing_camera_sequence(tmp_path: Path
         )
 
 
-def test_lerobot_conversion_rejects_legacy_npz_raw_format(tmp_path: Path, monkeypatch) -> None:
-    raw_dir = tmp_path / "raw"
-    _write_legacy_npz_marker(raw_dir / "episode_000")
-    monkeypatch.setattr(convert_yam_data_to_lerobot, "HF_LEROBOT_HOME", tmp_path / "lerobot")
-
-    with pytest.raises(ValueError, match="only supports the canonical MCAP raw format"):
-        convert_yam_data_to_lerobot.main(
-            convert_yam_data_to_lerobot.Args(
-                raw_dir=raw_dir,
-                repo_id="local/yam_regression_npz",
-                raw_format="npz",
-                image_writer_processes=0,
-                image_writer_threads=0,
-            )
-        )
-
-
 def test_mcap_to_lerobot_conversion_preserves_gripper_values(tmp_path: Path, monkeypatch) -> None:
     expected = data_regression.make_synthetic_episode()
     raw_dir = tmp_path / "raw"
@@ -432,7 +416,6 @@ def test_mcap_to_lerobot_conversion_preserves_gripper_values(tmp_path: Path, mon
         convert_yam_data_to_lerobot.Args(
             raw_dir=raw_dir,
             repo_id="local/yam_regression_mcap",
-            raw_format="auto",
             image_writer_processes=0,
             image_writer_threads=0,
         )
@@ -497,37 +480,139 @@ def test_mcap_episode_manifest_selection_preserves_order_and_rejects_bad_entries
     manifest = tmp_path / "episodes.txt"
     manifest.write_text("episode_b\n# comment\nepisode_a\n")
 
-    selected = convert_yam_data_to_lerobot._episode_dirs(raw_dir, manifest, "mcap")  # noqa: SLF001
+    selected = convert_yam_data_to_lerobot._episode_dirs(raw_dir, manifest)  # noqa: SLF001
 
     assert selected == [raw_dir / "episode_b", raw_dir / "episode_a"]
 
     manifest.write_text("episode_a\nepisode_a\n")
     with pytest.raises(ValueError, match="Duplicate episode"):
-        convert_yam_data_to_lerobot._episode_dirs(raw_dir, manifest, "mcap")  # noqa: SLF001
+        convert_yam_data_to_lerobot._episode_dirs(raw_dir, manifest)  # noqa: SLF001
 
     manifest.write_text("missing\n")
     with pytest.raises(FileNotFoundError, match="Manifest-listed episode"):
-        convert_yam_data_to_lerobot._episode_dirs(raw_dir, manifest, "mcap")  # noqa: SLF001
+        convert_yam_data_to_lerobot._episode_dirs(raw_dir, manifest)  # noqa: SLF001
 
 
-def test_lerobot_conversion_auto_rejects_legacy_npz_directories(tmp_path: Path, monkeypatch) -> None:
-    raw_dir = tmp_path / "raw"
-    _write_legacy_npz_marker(raw_dir / "episode_000")
-    monkeypatch.setattr(convert_yam_data_to_lerobot, "HF_LEROBOT_HOME", tmp_path / "lerobot")
+def test_modal_preprocess_command_runs_process_only_mcap_conversion() -> None:
+    cmd = modal_app._preprocess_yam_mcap_to_lerobot_cmd(  # noqa: SLF001
+        raw_dir="/mnt/yam/raw/yam_data/raw",
+        episode_manifest="/mnt/yam/raw/yam_data/manifests/pi05_yam_bimanual_50hz_24demo.txt",
+        repo_id="local/yam_bimanual",
+        mode="image",
+        episode_processes=8,
+        scratch_dir="/tmp/yam_lerobot_preprocess",
+        profile_jsonl="/tmp/yam_lerobot_preprocess/profile.jsonl",
+        overwrite=True,
+    )
 
-    with pytest.raises(FileNotFoundError, match="No recorded YAM episodes"):
-        convert_yam_data_to_lerobot.main(
-            convert_yam_data_to_lerobot.Args(
-                raw_dir=raw_dir,
-                repo_id="local/yam_regression_npz_auto",
-                raw_format="auto",
-                image_writer_processes=0,
-                image_writer_threads=0,
-            )
+    assert cmd == [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "examples.yam_real.convert_yam_data_to_lerobot",
+        "--raw-dir",
+        "/mnt/yam/raw/yam_data/raw",
+        "--repo-id",
+        "local/yam_bimanual",
+        "--mode",
+        "image",
+        "--episode-processes",
+        "8",
+        "--scratch-dir",
+        "/tmp/yam_lerobot_preprocess",
+        "--profile-jsonl",
+        "/tmp/yam_lerobot_preprocess/profile.jsonl",
+        "--episode-manifest",
+        "/mnt/yam/raw/yam_data/manifests/pi05_yam_bimanual_50hz_24demo.txt",
+        "--overwrite",
+    ]
+    assert "--image-writer-processes" not in cmd
+    assert "--image-writer-threads" not in cmd
+
+    resume_cmd = modal_app._preprocess_yam_mcap_to_lerobot_cmd(  # noqa: SLF001
+        raw_dir="/mnt/yam/raw/yam_data/raw",
+        episode_manifest=None,
+        repo_id="local/yam_bimanual",
+        mode="image",
+        episode_processes=8,
+        scratch_dir="/tmp/yam_lerobot_preprocess",
+        profile_jsonl="/tmp/yam_lerobot_preprocess/profile.jsonl",
+        overwrite=False,
+        resume=True,
+    )
+    assert "--episode-manifest" not in resume_cmd
+    assert "--overwrite" not in resume_cmd
+    assert resume_cmd[-1] == "--resume"
+
+    with pytest.raises(ValueError, match="overwrite and resume"):
+        modal_app._preprocess_yam_mcap_to_lerobot_cmd(  # noqa: SLF001
+            raw_dir="/mnt/yam/raw/yam_data/raw",
+            episode_manifest=None,
+            repo_id="local/yam_bimanual",
+            mode="image",
+            episode_processes=8,
+            scratch_dir="/tmp/yam_lerobot_preprocess",
+            profile_jsonl="/tmp/yam_lerobot_preprocess/profile.jsonl",
+            overwrite=True,
+            resume=True,
         )
 
 
-def test_mcap_to_lerobot_conversion_rejects_timing_mismatch_and_allows_override(
+def test_parallel_mcap_to_lerobot_conversion_preserves_dataset_contract(tmp_path: Path, monkeypatch) -> None:
+    expected = data_regression.make_synthetic_episode()
+    raw_dir = tmp_path / "raw"
+    data_regression.write_mcap_fixture(expected, raw_dir / "episode_a")
+    data_regression.write_mcap_fixture(expected, raw_dir / "episode_b")
+    manifest = tmp_path / "episodes.txt"
+    manifest.write_text("episode_b\nepisode_a\n")
+    lerobot_home = tmp_path / "lerobot"
+    monkeypatch.setattr(convert_yam_data_to_lerobot, "HF_LEROBOT_HOME", lerobot_home)
+
+    convert_yam_data_to_lerobot.main(
+        convert_yam_data_to_lerobot.Args(
+            raw_dir=raw_dir,
+            episode_manifest=manifest,
+            repo_id="local/yam_parallel_mcap",
+            image_writer_processes=0,
+            image_writer_threads=0,
+            episode_processes=2,
+            scratch_dir=tmp_path / "scratch",
+            profile_jsonl=tmp_path / "profile.jsonl",
+        )
+    )
+
+    output_root = lerobot_home / "local/yam_parallel_mcap"
+    first = data_regression.load_lerobot_episode(
+        "local/yam_parallel_mcap",
+        root=output_root,
+        episode_index=0,
+    )
+    second = data_regression.load_lerobot_episode(
+        "local/yam_parallel_mcap",
+        root=output_root,
+        episode_index=1,
+    )
+    data_regression.compare_canonical_episodes(expected, first)
+    data_regression.compare_canonical_episodes(expected, second)
+    summary_records = [json.loads(line) for line in (output_root / "conversion_summary.jsonl").read_text().splitlines()]
+    profile_records = [json.loads(line) for line in (output_root / "conversion_profile.jsonl").read_text().splitlines()]
+    assert [record["rows"] for record in summary_records] == [expected.num_frames, expected.num_frames]
+    assert {record["episode_index"] for record in profile_records} == {0, 1}
+    assert {record["episode_name"] for record in profile_records} == {"episode_a", "episode_b"}
+    assert all(record["aggregate_frames_per_s"] > 0 for record in profile_records)
+    assert all(record["eta_s"] >= 0 for record in profile_records)
+
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset = LeRobotDataset("local/yam_parallel_mcap", root=output_root)
+    assert dataset.meta.total_episodes == 2
+    assert dataset.meta.total_frames == expected.num_frames * 2
+    item = dataset[0]
+    assert _to_numpy(item["observation.images.cam_high"]).shape == (3, 480, 640)
+
+
+def test_mcap_to_lerobot_conversion_rejects_timing_mismatch(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -552,24 +637,10 @@ def test_mcap_to_lerobot_conversion_rejects_timing_mismatch_and_allows_override(
             convert_yam_data_to_lerobot.Args(
                 raw_dir=raw_dir,
                 repo_id="local/yam_regression_bad_mcap_timing",
-                raw_format="mcap",
                 image_writer_processes=0,
                 image_writer_threads=0,
             )
         )
-
-    convert_yam_data_to_lerobot.main(
-        convert_yam_data_to_lerobot.Args(
-            raw_dir=raw_dir,
-            repo_id="local/yam_regression_allowed_mcap_timing",
-            raw_format="mcap",
-            allow_timing_mismatch=True,
-            image_writer_processes=0,
-            image_writer_threads=0,
-        )
-    )
-    summary_path = lerobot_home / "local/yam_regression_allowed_mcap_timing" / "conversion_summary.jsonl"
-    assert "timestamp median dt" in summary_path.read_text()
 
 
 def test_yam_training_data_config_preserves_absolute_gripper_targets() -> None:
@@ -749,17 +820,6 @@ def _gradient_frame(sequence_id: int, camera_idx: int) -> np.ndarray:
     image[:, :, 1] = np.linspace(0, 255, 640, dtype=np.uint8)[None, :]
     image[:, :, 2] = np.linspace(0, 255, 480, dtype=np.uint8)[:, None]
     return np.ascontiguousarray(image)
-
-
-def _write_legacy_npz_marker(episode_dir: Path) -> Path:
-    episode_dir.mkdir(parents=True, exist_ok=False)
-    np.savez_compressed(
-        episode_dir / "episode.npz",
-        state=np.zeros((1, 14), dtype=np.float32),
-        action=np.zeros((1, 14), dtype=np.float32),
-        timestamp=np.asarray([0.0], dtype=np.float64),
-    )
-    return episode_dir
 
 
 def _write_fixture_recording_context(episode_dir: Path) -> None:

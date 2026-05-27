@@ -65,8 +65,8 @@ def main(args: Args) -> None:
         robots.append(follower_r)
 
         first_l, first_r = common.split_bimanual(actions[0])
-        follower_l.move_joints(common.openpi_arm_state_to_i2rt(first_l), time_interval_s=args.move_to_first_s)
-        follower_r.move_joints(common.openpi_arm_state_to_i2rt(first_r), time_interval_s=args.move_to_first_s)
+        follower_l.move_joints(common.monopi_arm_state_to_i2rt(first_l), time_interval_s=args.move_to_first_s)
+        follower_r.move_joints(common.monopi_arm_state_to_i2rt(first_r), time_interval_s=args.move_to_first_s)
 
         command = common.pack_bimanual(common.get_follower_state(follower_l), common.get_follower_state(follower_r))
         dt = 1.0 / fps
@@ -79,8 +79,8 @@ def main(args: Args) -> None:
                 max_gripper_step=args.max_gripper_step,
             )
             left, right = common.split_bimanual(command)
-            follower_l.command_joint_pos(common.openpi_arm_state_to_i2rt(left))
-            follower_r.command_joint_pos(common.openpi_arm_state_to_i2rt(right))
+            follower_l.command_joint_pos(common.monopi_arm_state_to_i2rt(left))
+            follower_r.command_joint_pos(common.monopi_arm_state_to_i2rt(right))
             next_t += dt
             sleep_s = next_t - time.monotonic()
             if sleep_s > 0:

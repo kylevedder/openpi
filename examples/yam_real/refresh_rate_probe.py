@@ -75,10 +75,10 @@ class Args:
     camera_height: int = 480
     camera_fps: float = 30.0
     camera_pixel_format: str = "MJPG"
-    skip_camera_mode_verify: bool = False
     record_camera_capture_mode: Literal["async_latest", "blocking"] = "async_latest"
     camera_startup_timeout_s: float = 5.0
     max_camera_age_s: float = 0.25
+    record_loop_sleep_s: float = 0.005
     warmup_frames: int = 3
     max_samples_per_mode: int = 800
     image_save_max_samples: int = 300
@@ -224,10 +224,11 @@ def analyze_samples(samples: list[Sample], *, fps: float) -> dict[str, Any]:
 
 def _probe_camera_controls(args: Args) -> list[Sample]:
     samples: list[Sample] = []
-    config = dataclasses.replace(_camera_config(args), verify_mode=False)
+    config = _camera_config(args)
     for camera_name, camera_path in common.CAMERA_PATHS.items():
         camera = _open_camera(camera_name, camera_path, config=config)
         try:
+            capture_properties = camera.capture_properties()
             samples.append(
                 _sample(
                     "camera-controls",
@@ -237,8 +238,8 @@ def _probe_camera_controls(args: Args) -> list[Sample]:
                     extra={
                         "camera_path": camera_path,
                         "requested_config": config.as_manifest(),
-                        "capture_properties": camera.capture_properties(),
-                        "capture_controls": {},
+                        "capture_properties": capture_properties,
+                        "observed_controls": capture_properties.get("observed_controls", {}),
                         "backend": "linuxpy-v4l2",
                     },
                 )
@@ -1155,7 +1156,6 @@ def _camera_config(args: Args) -> common.CameraConfig:
         frame_size=(args.camera_width, args.camera_height),
         fps=int(args.camera_fps),
         pixel_format=args.camera_pixel_format,
-        verify_mode=not args.skip_camera_mode_verify,
     )
 
 
@@ -1300,9 +1300,7 @@ def _warmup_camera_set(cameras: common.CameraSet, warmup_frames: int) -> None:
 
 
 def _capture_properties(camera: common.LinuxpyV4L2Camera) -> dict[str, Any]:
-    properties = camera.capture_properties()
-    properties["controls"] = {}
-    return properties
+    return camera.capture_properties()
 
 
 def _fourcc_to_str(value: int) -> str:

@@ -22,6 +22,12 @@ RECORD_BUTTON_INDEX = teleop.RECORD_BUTTON_INDEX
 YamLeader = teleop.YamLeader
 TeleopPair = teleop.TeleopPair
 
+DEFAULT_DIAGNOSTICS_DIR = Path("yam_data/logs/record_episode")
+
+
+def _default_diagnostics_jsonl_path() -> Path:
+    return DEFAULT_DIAGNOSTICS_DIR / f"record_episode_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+
 
 @dataclasses.dataclass
 class Args:
@@ -35,18 +41,15 @@ class Args:
     camera_pixel_format: str = "MJPG"
     camera_startup_timeout_s: float = 5.0
     max_camera_age_s: float = 0.25
-    skip_camera_mode_verify: bool = False
     max_duration_s: float | None = None
     gripper: Literal["crank_4310", "linear_3507", "linear_4310"] = "linear_4310"
     bilateral_kp: float = 0.2
     ee_mass: float | None = None
     use_gravity_comp: bool = True
-    status_haptic_cue: bool = True
-    status_cue_gain: float = 0.08
     record_button_debounce_s: float = 1.0
     record_only_when_synced: bool = True
     startup_check_only: bool = False
-    diagnostics_jsonl: Path | None = None
+    diagnostics_jsonl: Path = dataclasses.field(default_factory=_default_diagnostics_jsonl_path)
     auto_start: bool = False
     exit_after_max_duration: bool = False
     record_loop_sleep_s: float = 0.005
@@ -88,6 +91,41 @@ def _print_recording_banner(title: str, details: list[str] | None = None) -> Non
             print(f"# {line.center(inner_width)} #")
     print("#" * width)
     print(flush=True)
+
+
+def _camera_actual_mode_summary_lines(camera_actual_modes: dict[str, dict]) -> list[str]:
+    lines = []
+    for camera_name in common.CAMERA_NAMES:
+        properties = camera_actual_modes.get(camera_name, {})
+        actual_format = properties.get("actual_format") or {}
+        controls = properties.get("observed_controls") or {}
+        width = actual_format.get("width", "?")
+        height = actual_format.get("height", "?")
+        pixel_format = _short_pixel_format(actual_format.get("pixel_format", "?"))
+        fps = properties.get("actual_fps", "?")
+        bus_info = properties.get("bus_info", "?")
+        auto_exposure = _control_value(controls, "auto_exposure")
+        exposure = _control_value(controls, "exposure_time_absolute")
+        gain = _control_value(controls, "gain")
+        lines.append(
+            f"{camera_name}: {width}x{height} {pixel_format} @ {fps} fps, "
+            f"bus={bus_info}, auto_exposure={auto_exposure}, exposure={exposure}, gain={gain}"
+        )
+    return lines
+
+
+def _short_pixel_format(value: Any) -> str:
+    name = getattr(value, "name", None)
+    if name:
+        return str(name)
+    return str(value)
+
+
+def _control_value(controls: dict[str, Any], name: str) -> Any:
+    control = controls.get(name) or {}
+    if isinstance(control, dict):
+        return control.get("value", "?")
+    return "?"
 
 
 class RecorderDiagnostics:
@@ -273,7 +311,7 @@ def main(args: Args) -> None:
     print(f"Output root: {args.output_dir}")
     print("Controls: leader top buttons toggle sync per side; leader bottom button or 'r' starts/stops and saves.")
     print("'q' saves any active recording and exits.")
-    print("Recording haptic cue: one leader pulse=start, two leader pulses=stop.")
+    print(f"Diagnostics JSONL: {args.diagnostics_jsonl}")
     print("Hardware backend: multiprocessing workers (cameras, teleop, writer).")
 
     episode_dir: Path | None = None
@@ -291,7 +329,6 @@ def main(args: Args) -> None:
         frame_size=(args.camera_width, args.camera_height),
         fps=int(args.camera_fps),
         pixel_format=args.camera_pixel_format,
-        verify_mode=not args.skip_camera_mode_verify,
     )
     runtime = process_runtime.YamMultiprocessRuntime(
         camera_config=camera_config,
@@ -365,8 +402,6 @@ def main(args: Args) -> None:
                 f"FPS: {args.fps:g}",
             ],
         )
-        if args.status_haptic_cue:
-            runtime.emit_recording_status(recording=True, gain=args.status_cue_gain)
 
     def stop_episode() -> None:
         nonlocal episode_dir, recording
@@ -381,8 +416,6 @@ def main(args: Args) -> None:
                     "Saving episode now",
                 ],
             )
-            if args.status_haptic_cue:
-                runtime.emit_recording_status(recording=False, gain=args.status_cue_gain)
 
         saved = save_episode()
         if saved:
@@ -407,7 +440,10 @@ def main(args: Args) -> None:
             camera_actual_modes = runtime.camera_actual_modes
             print("Camera capture mode: multiprocessing_shared_memory")
             print(f"Camera requested mode: {camera_config.as_manifest()}")
-            print(f"Camera actual modes: {camera_actual_modes}")
+            print("Camera actual modes:")
+            for line in _camera_actual_mode_summary_lines(camera_actual_modes):
+                print(f"  {line}")
+            print("Full camera metadata is written to diagnostics JSONL and recording_context.json.")
             print(f"Worker PIDs: {runtime.process_ids}")
             diagnostics.write_context(
                 {

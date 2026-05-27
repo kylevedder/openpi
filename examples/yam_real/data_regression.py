@@ -43,7 +43,6 @@ class CanonicalEpisode:
 @dataclasses.dataclass(frozen=True)
 class Args:
     inputs: tuple[Path, ...] = ()
-    old_good_dir: Path | None = None
     current_raw_dir: Path | None = DEFAULT_CURRENT_RAW_DIR
     lerobot_repo_id: str | None = None
     lerobot_root: Path | None = None
@@ -428,8 +427,6 @@ def print_summary_table(records: list[dict]) -> None:
 
 def _default_and_user_paths(args: Args) -> list[Path]:
     paths = list(args.inputs)
-    if args.old_good_dir is not None:
-        paths.append(args.old_good_dir)
     if args.current_raw_dir is not None:
         paths.append(args.current_raw_dir)
     return paths

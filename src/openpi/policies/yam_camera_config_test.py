@@ -21,13 +21,16 @@ def test_record_episode_defaults_match_standard_mcap_record_command() -> None:
     assert args.camera_height == 480
     assert args.camera_pixel_format == "MJPG"
     assert args.use_gravity_comp is True
+    assert args.diagnostics_jsonl.parent == Path("yam_data/logs/record_episode")
+    assert args.diagnostics_jsonl.name.startswith("record_episode_")
+    assert args.diagnostics_jsonl.suffix == ".jsonl"
 
 
 def test_linuxpy_camera_rejects_unsupported_50hz_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_env = FakeCameraEnv(max_fps=30.0)
     fake_env.install(monkeypatch)
 
-    config = common.CameraConfig(frame_size=(640, 480), fps=50, pixel_format="MJPG", verify_mode=True)
+    config = common.CameraConfig(frame_size=(640, 480), fps=50, pixel_format="MJPG")
 
     with pytest.raises(RuntimeError, match="640x480@50fps"), common.LinuxpyV4L2Camera(
         "cam_high", "/dev/fake", config
@@ -41,7 +44,7 @@ def test_linuxpy_camera_sets_mjpg_mode_and_returns_rgb(monkeypatch: pytest.Monke
     fake_env = FakeCameraEnv(max_fps=30.0)
     fake_env.install(monkeypatch)
 
-    config = common.CameraConfig(frame_size=(640, 480), fps=30, pixel_format="MJPG", verify_mode=True)
+    config = common.CameraConfig(frame_size=(640, 480), fps=30, pixel_format="MJPG")
     with common.LinuxpyV4L2Camera("cam_high", "/dev/fake", config) as camera:
         frame = camera.read()
 
@@ -51,13 +54,14 @@ def test_linuxpy_camera_sets_mjpg_mode_and_returns_rgb(monkeypatch: pytest.Monke
     assert frame.frame.dtype == np.uint8
     assert frame.sequence_index == 0
     np.testing.assert_allclose(frame.frame[0, 0], np.asarray([0, 20, 40], dtype=np.uint8), atol=1)
+    assert fake_env.devices[0].control_writes == []
 
 
 def test_linuxpy_camera_accepts_method_frame_sizes_with_fps_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_env = FakeCameraEnv(max_fps=30.0, linuxpy_024_info=True)
     fake_env.install(monkeypatch)
 
-    config = common.CameraConfig(frame_size=(640, 480), fps=30, pixel_format="MJPG", verify_mode=True)
+    config = common.CameraConfig(frame_size=(640, 480), fps=30, pixel_format="MJPG")
     with common.LinuxpyV4L2Camera("cam_high", "/dev/fake", config) as camera:
         frame = camera.read()
 
@@ -69,7 +73,7 @@ def test_linuxpy_camera_capture_properties_include_actual_mode(monkeypatch: pyte
     fake_env = FakeCameraEnv(max_fps=30.0)
     fake_env.install(monkeypatch)
 
-    config = common.CameraConfig(frame_size=(640, 480), fps=30, pixel_format="MJPG", verify_mode=True)
+    config = common.CameraConfig(frame_size=(640, 480), fps=30, pixel_format="MJPG")
     with common.LinuxpyV4L2Camera("cam_high", "/dev/fake", config) as camera:
         properties = camera.capture_properties()
 
@@ -80,18 +84,61 @@ def test_linuxpy_camera_capture_properties_include_actual_mode(monkeypatch: pyte
     assert properties["actual_format"]["width"] == 640
     assert properties["actual_format"]["height"] == 480
     assert properties["actual_format"]["pixel_format"] == "MJPG"
+    assert properties["observed_controls"]["auto_exposure"]["value"] == 3
+    assert fake_env.devices[0].control_writes == []
 
 
 def test_async_camera_set_returns_latest_frame_without_waiting_for_next_read(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_env = FakeCameraEnv(max_fps=30.0, read_delay_s=0.03)
     fake_env.install(monkeypatch)
 
-    config = common.CameraConfig(fps=30, verify_mode=False)
+    config = common.CameraConfig(fps=30)
     with common.AsyncCameraSet(paths={"cam_high": "/dev/fake"}, config=config, startup_timeout_s=1.0) as cameras:
         first = cameras.snapshot(max_age_s=1.0)
         second = cameras.snapshot(max_age_s=1.0)
 
     assert first.metadata["cam_high"]["sequence_index"] == second.metadata["cam_high"]["sequence_index"]
+
+
+def test_camera_config_defaults_match_monopi_v4l2() -> None:
+    config = common.CameraConfig()
+
+    assert config.frame_size == (640, 480)
+    assert config.fps == 30
+    assert config.pixel_format == "MJPG"
+    assert config.usb_vendor_product == ""
+    assert config.crop is None
+    assert config.resize is None
+    assert config.rotate_180 is False
+    assert config.split_stereo is False
+    assert config.key == "rgb"
+
+
+def test_image_transform_order_matches_monopi(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = np.arange(4 * 6 * 3, dtype=np.uint8).reshape((4, 6, 3))
+    cropped = image[1:3, 1:5, :]
+    resized = np.arange(2 * 3 * 3, dtype=np.uint8).reshape((2, 3, 3))
+
+    def fake_resize(input_image, size, interpolation):
+        assert size == (3, 2)
+        assert interpolation == common.cv2.INTER_LINEAR
+        np.testing.assert_array_equal(input_image, cropped)
+        return resized.copy()
+
+    monkeypatch.setattr(common.cv2, "resize", fake_resize)
+    config = common.CameraConfig(crop=(1, 1, 5, 3), resize=(3, 2), rotate_180=True)
+
+    transformed = common._apply_image_transform(image, config)  # noqa: SLF001
+
+    np.testing.assert_array_equal(transformed, resized[::-1, ::-1, :])
+
+
+def test_default_image_transform_is_noop() -> None:
+    image = np.zeros((4, 6, 3), dtype=np.uint8)
+
+    transformed = common._apply_image_transform(image, common.CameraConfig())  # noqa: SLF001
+
+    assert transformed is image
 
 
 def test_teleop_pair_unsynced_action_equals_follower_state() -> None:
@@ -181,6 +228,39 @@ class FakeActualFormat:
         self.pixel_format = pixel_format
 
 
+class FakeControl:
+    def __init__(
+        self,
+        device: "FakeDevice",
+        name: str,
+        value,
+        *,
+        default=None,
+        minimum=None,
+        maximum=None,
+        step=None,
+        flags=0,
+    ) -> None:
+        self.device = device
+        self.name = name
+        self.default = value if default is None else default
+        self.minimum = minimum
+        self.maximum = maximum
+        self.step = step
+        self.flags = flags
+        self.type = "fake"
+        self._value = value
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, value) -> None:
+        self.device.control_writes.append((self.name, value))
+        self._value = value
+
+
 class FakeLinuxpy024Info:
     bus_info = "usb-fake"
     card = "FakeCam"
@@ -220,6 +300,11 @@ class FakeDevice:
         self.frame_index = 0
         self.actual_format: FakeActualFormat | None = None
         self.actual_fps: float | None = None
+        self.control_writes: list[tuple[str, object]] = []
+        self.controls = {
+            10094849: FakeControl(self, "auto_exposure", 3, default=3, minimum=0, maximum=3, step=1),
+            10094850: FakeControl(self, "exposure_time_absolute", 156, default=156, minimum=1, maximum=5000, step=1),
+        }
 
     def open(self) -> None:
         self.opened = True
@@ -280,6 +365,3 @@ class FakeLeader:
 
     def set_bilateral(self, *, enabled: bool, gain: float) -> None:
         del enabled, gain
-
-    def pulse_haptic(self, *, pattern_s: tuple[float, ...], gain: float) -> None:
-        del pattern_s, gain

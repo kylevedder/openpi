@@ -394,12 +394,6 @@ class TeleopProcessGroup:
                 pending.remove(side)
         return responses
 
-    def emit_recording_status(self, *, recording: bool, gain: float, timeout_s: float = 3.0) -> None:
-        request_id = f"status-{time.monotonic_ns()}"
-        for side, conn in self._connections.items():
-            conn.send({"type": "recording_status", "request_id": request_id, "side": side, "recording": recording, "gain": gain})
-        self._wait_for_acks("recording_status_ack", request_id=request_id, timeout_s=timeout_s)
-
     def close(self) -> None:
         request_id = f"shutdown-{time.monotonic_ns()}"
         for conn in self._connections.values():
@@ -737,9 +731,6 @@ class YamMultiprocessRuntime:
             return {"type": "episode_stopped", "written_rows": 0}
         return self.writer.stop_episode(timeout_s=self._writer_drain_timeout_s)
 
-    def emit_recording_status(self, *, recording: bool, gain: float) -> None:
-        self.teleop.emit_recording_status(recording=recording, gain=gain)
-
     def close(self) -> None:
         if self.writer is not None:
             with contextlib.suppress(Exception):
@@ -865,9 +856,6 @@ def _teleop_worker_main(
                         "timings_ms": timings_ms,
                     }
                 )
-            elif message_type == "recording_status":
-                pair.emit_recording_status(recording=bool(message["recording"]), gain=float(message["gain"]))
-                conn.send({"type": "recording_status_ack", "side": side, "request_id": request_id})
             elif message_type == "shutdown":
                 conn.send({"type": "shutdown_ack", "side": side, "request_id": request_id})
                 break

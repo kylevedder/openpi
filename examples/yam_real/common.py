@@ -39,8 +39,8 @@ STATE_ORDER = yam_policy.STATE_ORDER
 ACTION_SPACE = yam_policy.ACTION_SPACE
 GRIPPER_CONVENTION = yam_policy.GRIPPER_CONVENTION
 I2RT_GRIPPER_CONVENTION = yam_policy.I2RT_GRIPPER_CONVENTION
-i2rt_arm_state_to_openpi = yam_policy.i2rt_arm_state_to_openpi
-openpi_arm_state_to_i2rt = yam_policy.openpi_arm_state_to_i2rt
+i2rt_arm_state_to_monopi = yam_policy.i2rt_arm_state_to_monopi
+monopi_arm_state_to_i2rt = yam_policy.monopi_arm_state_to_i2rt
 
 
 def ensure_i2rt_importable() -> None:
@@ -62,10 +62,12 @@ class CameraConfig:
     frame_size: tuple[int, int] = (640, 480)
     fps: int = 30
     pixel_format: str = "MJPG"
+    usb_vendor_product: str = ""
     crop: tuple[int, int, int, int] | None = None
     resize: tuple[int, int] | None = None
     rotate_180: bool = False
-    verify_mode: bool = True
+    split_stereo: bool = False
+    key: str = "rgb"
 
     @property
     def width(self) -> int:
@@ -126,12 +128,19 @@ class LinuxpyV4L2Camera:
             device.close()
             raise RuntimeError(f"Could not open camera {self.name}: {self.path}")
 
-        if self.config.verify_mode:
-            issues = camera_mode_issues(camera_capabilities(device), self.config)
-            if issues:
+        if self.config.usb_vendor_product:
+            usb_vendor_product = _get_usb_vendor_product(str(getattr(device.info, "bus_info", "")))
+            if usb_vendor_product != self.config.usb_vendor_product:
                 device.close()
-                detail = "; ".join(issues)
-                raise RuntimeError(f"Camera {self.name} mode mismatch for {self.path}: {detail}")
+                raise RuntimeError(
+                    f"Camera {self.name} expected USB {self.config.usb_vendor_product}, found {usb_vendor_product}"
+                )
+
+        issues = camera_mode_issues(camera_capabilities(device), self.config)
+        if issues:
+            device.close()
+            detail = "; ".join(issues)
+            raise RuntimeError(f"Camera {self.name} mode mismatch for {self.path}: {detail}")
 
         width, height = self.config.frame_size
         capture = video_device.VideoCapture(device)
@@ -228,6 +237,7 @@ class LinuxpyV4L2Camera:
                 "card": getattr(info, "card", ""),
                 "driver": getattr(info, "driver", ""),
                 "frame_sizes": _frame_sizes_as_dicts(info),
+                "observed_controls": _device_controls_as_dicts(self._device),
             }
         )
         fmt = _device_get_format(self._device)
@@ -445,7 +455,6 @@ def camera_mode_issues(properties: dict[str, Any], config: CameraConfig) -> list
         for frame_size in frame_sizes
         if frame_size.get("width") == config.width
         and frame_size.get("height") == config.height
-        and _pixel_formats_match(frame_size.get("pixel_format", ""), config.pixel_format)
         and float(frame_size.get("min_fps", 0.0)) <= float(config.fps)
         and float(config.fps) <= float(frame_size.get("max_fps", float("inf")))
     ]
@@ -466,6 +475,21 @@ def _validate_camera_config(config: CameraConfig) -> None:
         raise ValueError(f"Camera fps must be positive, got {config.fps}")
     if not config.pixel_format:
         raise ValueError("Camera pixel_format must be non-empty")
+
+
+def _get_usb_vendor_product(usb_bus_info: str) -> str:
+    _, usb_bus, ports = usb_bus_info.split("-")
+    for usb_bus_path in Path(f"/sys/bus/pci/devices/{usb_bus}").glob("usb*"):
+        if usb_bus_path.name == "usbmon":
+            continue
+        bus_number = usb_bus_path.name[3:]
+        usb_dev_path = Path(f"/sys/bus/usb/devices/{bus_number}-{ports}")
+        if not usb_dev_path.exists():
+            continue
+        id_vendor = (usb_dev_path / "idVendor").read_text().strip()
+        id_product = (usb_dev_path / "idProduct").read_text().strip()
+        return f"{id_vendor}:{id_product}"
+    raise RuntimeError(f"Could not find USB device for {usb_bus_info}")
 
 
 def _monotonic_timestamp_to_wall_ns(monotonic_timestamp_s: float) -> int:
@@ -558,13 +582,44 @@ def _pixel_format_label(pixel_format: Any) -> str:
     return str(pixel_format)
 
 
-def _pixel_formats_match(actual: Any, requested: str) -> bool:
-    actual_normalized = str(actual).upper()
-    if not actual_normalized:
-        return True
-    requested_normalized = requested.upper()
-    aliases = {"MJPG": {"MJPG", "MJPEG"}, "MJPEG": {"MJPG", "MJPEG"}}
-    return actual_normalized in aliases.get(requested_normalized, {requested_normalized})
+def _device_controls_as_dicts(device: Any) -> dict[str, dict[str, Any]]:
+    controls = getattr(device, "controls", None)
+    if controls is None:
+        return {}
+    try:
+        items = list(controls.items())
+    except Exception:
+        return {}
+
+    result = {}
+    for control_id, control in items:
+        display_name = str(getattr(control, "name", "") or "")
+        config_name = str(getattr(control, "config_name", "") or "")
+        key = config_name or display_name or str(control_id)
+        result[key] = {
+            "id": _jsonable_camera_property(control_id),
+            "name": display_name,
+            "config_name": config_name,
+            "value": _jsonable_camera_property(getattr(control, "value", None)),
+            "default": _jsonable_camera_property(getattr(control, "default", None)),
+            "minimum": _jsonable_camera_property(getattr(control, "minimum", None)),
+            "maximum": _jsonable_camera_property(getattr(control, "maximum", None)),
+            "step": _jsonable_camera_property(getattr(control, "step", None)),
+            "flags": _jsonable_camera_property(getattr(control, "flags", None)),
+            "type": _jsonable_camera_property(getattr(control, "type", None)),
+            "read_only": _control_flag(control, "is_flagged_read_only"),
+            "inactive": _control_flag(control, "is_flagged_inactive"),
+        }
+    return result
+
+
+def _control_flag(control: Any, attr: str) -> bool:
+    value = getattr(control, attr, False)
+    if callable(value):
+        with contextlib.suppress(Exception):
+            return bool(value())
+        return False
+    return bool(value)
 
 
 def _device_get_format(device: Any) -> Any | None:
@@ -628,27 +683,14 @@ def make_episode_dir(root: Path, name: str | None = None) -> Path:
     return episode_dir
 
 
-def save_frames(episode_dir: Path, frame_index: int, frames: dict[str, np.ndarray]) -> dict[str, str]:
-    rel_paths = {}
-    for camera_name, frame in frames.items():
-        rel_path = Path("images") / camera_name / f"{frame_index:06d}.jpg"
-        out_path = episode_dir / rel_path
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        if not cv2.imwrite(str(out_path), bgr):
-            raise RuntimeError(f"Failed to write image {out_path}")
-        rel_paths[camera_name] = str(rel_path)
-    return rel_paths
-
-
 def get_follower_state(robot) -> np.ndarray:
-    """Return follower state in the OpenPI/ARX convention."""
+    """Return follower state in the canonical MonoPI YAM convention."""
     obs = robot.get_observations()
     arm = np.asarray(obs["joint_pos"], dtype=np.float32)
     gripper = np.asarray(obs.get("gripper_pos", np.array([1.0])), dtype=np.float32)
     if arm.shape != (6,) or gripper.shape != (1,):
         raise RuntimeError(f"Unexpected follower observation shapes: arm={arm.shape}, gripper={gripper.shape}")
-    return yam_policy.i2rt_arm_state_to_openpi(np.concatenate([arm, gripper]).astype(np.float32))
+    return yam_policy.i2rt_arm_state_to_monopi(np.concatenate([arm, gripper]).astype(np.float32))
 
 
 def pack_bimanual(left: np.ndarray, right: np.ndarray) -> np.ndarray:

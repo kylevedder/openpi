@@ -75,7 +75,7 @@ def read_episode_metadata(episode_dir: Path) -> dict[str, Any]:
     if not metadata_path.is_file():
         raise RuntimeError(
             f"MCAP episode {episode_dir} is missing canonical sidecar {EPISODE_METADATA_FILENAME}. "
-            "Pre-cutover OpenPI/YAM MCAP episodes are unsupported."
+            "Only canonical MonoPI PiStream YAM MCAP episodes are supported."
         )
     try:
         metadata = json.loads(metadata_path.read_text())
@@ -413,7 +413,7 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
                 if ref.publisher_id or ref.key:
                     raise RuntimeError(
                         f"MCAP episode {episode_dir} action_snapshot at {message.log_time} contains "
-                        "legacy publisher_id/key snapshot refs. Canonical YAM MCAP requires index-only refs."
+                        "publisher_id/key snapshot refs. Canonical YAM MCAP requires index-only refs."
                     )
                 ref_field = snapshot_field_by_index[ref.index]
                 refs[ref_field] = FieldValueRef(

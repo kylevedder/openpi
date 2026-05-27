@@ -7,7 +7,7 @@ from openpi.policies import yam_policy
 from openpi.shared import jpeg_transport
 
 
-def test_yam_schema_matches_pi_arx_bimanual_slots():
+def test_yam_schema_matches_monopi_bimanual_slots():
     assert yam_policy.ARM_JOINT_ORDER == (
         "waist",
         "shoulder",
@@ -41,15 +41,15 @@ def test_yam_i2rt_gripper_conversion_happens_at_hardware_boundary():
     open_i2rt = np.array([0, 1, 2, 3, 4, 5, 1], dtype=np.float32)
 
     np.testing.assert_array_equal(
-        yam_policy.i2rt_arm_state_to_openpi(closed_i2rt),
+        yam_policy.i2rt_arm_state_to_monopi(closed_i2rt),
         np.array([0, 1, 2, 3, 4, 5, 1], dtype=np.float32),
     )
     np.testing.assert_array_equal(
-        yam_policy.i2rt_arm_state_to_openpi(open_i2rt),
+        yam_policy.i2rt_arm_state_to_monopi(open_i2rt),
         np.array([0, 1, 2, 3, 4, 5, 0], dtype=np.float32),
     )
     np.testing.assert_array_equal(
-        yam_policy.openpi_arm_state_to_i2rt(yam_policy.i2rt_arm_state_to_openpi(open_i2rt)),
+        yam_policy.monopi_arm_state_to_i2rt(yam_policy.i2rt_arm_state_to_monopi(open_i2rt)),
         open_i2rt,
     )
 

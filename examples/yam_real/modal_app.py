@@ -11,10 +11,12 @@ APP_NAME = "yam-openpi"
 OPENPI_ROOT = "/root/openpi"
 VOLUME_ROOT = "/mnt/yam"
 CONFIG_NAME = "pi05_yam_bimanual_50hz_jpeg_q85"
-DEFAULT_EXP_NAME = "yam_bimanual_50hz_jpeg_q85_recollect_20260525_23demo_v1"
+DEFAULT_EXP_NAME = "yam_bimanual_50hz_jpeg_q85_24demo_20260526_v1"
 SERVE_CHECKPOINT_STEP = 999
 QUIC_REGIONS = ["us-west-1", "westus"]
 QUIC_SCALEDOWN_WINDOW_S = 20 * 60
+DEFAULT_MODAL_RAW_DIR = f"{VOLUME_ROOT}/raw/yam_data/raw"
+DEFAULT_MODAL_EPISODE_MANIFEST = f"{VOLUME_ROOT}/raw/yam_data/manifests/pi05_yam_bimanual_50hz_24demo.txt"
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name("yam-openpi", create_if_missing=True)
@@ -82,6 +84,41 @@ def compute_norm_stats(config_name: str = CONFIG_NAME, max_frames: int | None = 
     cmd = ["uv", "run", "scripts/compute_norm_stats.py", "--config-name", config_name]
     if max_frames is not None:
         cmd.extend(["--max-frames", str(max_frames)])
+    subprocess.run(cmd, cwd=OPENPI_ROOT, check=True)
+    volume.commit()
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_ROOT: volume},
+    cpu=16.0,
+    memory=65536,
+    ephemeral_disk=524288,
+    timeout=6 * 60 * 60,
+)
+def preprocess_yam_mcap_to_lerobot(
+    raw_dir: str = DEFAULT_MODAL_RAW_DIR,
+    episode_manifest: str = DEFAULT_MODAL_EPISODE_MANIFEST,
+    repo_id: str = "local/yam_bimanual",
+    mode: str = "image",
+    episode_processes: int = 8,
+    scratch_dir: str = "/tmp/yam_lerobot_preprocess",
+    profile_jsonl: str = "/tmp/yam_lerobot_preprocess/profile.jsonl",
+    overwrite: bool = True,  # noqa: FBT001, FBT002
+    resume: bool = False,  # noqa: FBT001, FBT002
+) -> None:
+    _prepare_volume_paths()
+    cmd = _preprocess_yam_mcap_to_lerobot_cmd(
+        raw_dir=raw_dir,
+        episode_manifest=episode_manifest,
+        repo_id=repo_id,
+        mode=mode,
+        episode_processes=episode_processes,
+        scratch_dir=scratch_dir,
+        profile_jsonl=profile_jsonl,
+        overwrite=overwrite,
+        resume=resume,
+    )
     subprocess.run(cmd, cwd=OPENPI_ROOT, check=True)
     volume.commit()
 
@@ -233,6 +270,53 @@ def _train_cmd(
         cmd.extend(["--batch-size", str(batch_size)])
     if fsdp_devices is not None:
         cmd.extend(["--fsdp-devices", str(fsdp_devices)])
+    return cmd
+
+
+def _preprocess_yam_mcap_to_lerobot_cmd(
+    *,
+    raw_dir: str,
+    episode_manifest: str | None,
+    repo_id: str,
+    mode: str,
+    episode_processes: int,
+    scratch_dir: str,
+    profile_jsonl: str,
+    overwrite: bool,
+    resume: bool = False,
+) -> list[str]:
+    if mode not in {"image", "video"}:
+        raise ValueError(f"Unsupported conversion mode: {mode!r}")
+    if episode_processes < 1:
+        raise ValueError("preprocess_yam_mcap_to_lerobot requires at least one episode process")
+    if overwrite and resume:
+        raise ValueError("preprocess_yam_mcap_to_lerobot cannot use overwrite and resume together")
+
+    cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "examples.yam_real.convert_yam_data_to_lerobot",
+        "--raw-dir",
+        raw_dir,
+        "--repo-id",
+        repo_id,
+        "--mode",
+        mode,
+        "--episode-processes",
+        str(episode_processes),
+        "--scratch-dir",
+        scratch_dir,
+        "--profile-jsonl",
+        profile_jsonl,
+    ]
+    if episode_manifest:
+        cmd.extend(["--episode-manifest", episode_manifest])
+    if overwrite:
+        cmd.append("--overwrite")
+    if resume:
+        cmd.append("--resume")
     return cmd
 
 

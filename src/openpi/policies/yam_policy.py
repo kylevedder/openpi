@@ -45,7 +45,7 @@ class YamBimanualInputs(transforms.DataTransformFn):
     Expected runtime input:
     - images: dict[name, img] where img is either JPEG bytes, [C, H, W], or [H, W, C].
     - state: [14], ordered [left 6 joints, left gripper, right 6 joints, right gripper].
-      Grippers use the PI/ARX convention: 0.0=open, 1.0=closed.
+      Grippers use the canonical MonoPI YAM convention: 0.0=open, 1.0=closed.
     - actions: [action_horizon, 14], same order as state, only present during training.
     """
 
@@ -134,10 +134,10 @@ def as_arm_state(state: np.ndarray) -> np.ndarray:
     return state
 
 
-def i2rt_arm_state_to_openpi(state: np.ndarray) -> np.ndarray:
-    """Convert one 7D YAM state from i2rt convention to OpenPI/ARX convention.
+def i2rt_arm_state_to_monopi(state: np.ndarray) -> np.ndarray:
+    """Convert one 7D YAM state from the i2rt hardware convention to canonical MonoPI YAM.
 
-    i2rt linear grippers use 0=closed, 1=open. PI/ARX uses 0=open, 1=closed.
+    i2rt linear grippers use 0=closed, 1=open. Canonical MonoPI YAM uses 0=open, 1=closed.
     The six arm joint slots are already base-to-wrist in both conventions.
     """
     state = as_arm_state(state)
@@ -146,9 +146,9 @@ def i2rt_arm_state_to_openpi(state: np.ndarray) -> np.ndarray:
     return result
 
 
-def openpi_arm_state_to_i2rt(state: np.ndarray) -> np.ndarray:
-    """Convert one 7D OpenPI/ARX state to the YAM i2rt command convention."""
-    return i2rt_arm_state_to_openpi(state)
+def monopi_arm_state_to_i2rt(state: np.ndarray) -> np.ndarray:
+    """Convert one 7D canonical MonoPI YAM state to the i2rt hardware command convention."""
+    return i2rt_arm_state_to_monopi(state)
 
 
 def _parse_image(image) -> tuple[np.ndarray, str | None]:

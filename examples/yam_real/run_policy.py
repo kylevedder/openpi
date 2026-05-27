@@ -396,8 +396,8 @@ def _should_prefetch_action_chunk(
 
 def _command_followers(command: np.ndarray, follower_l, follower_r) -> None:
     left, right = common.split_bimanual(command)
-    follower_l.command_joint_pos(common.openpi_arm_state_to_i2rt(left))
-    follower_r.command_joint_pos(common.openpi_arm_state_to_i2rt(right))
+    follower_l.command_joint_pos(common.monopi_arm_state_to_i2rt(left))
+    follower_r.command_joint_pos(common.monopi_arm_state_to_i2rt(right))
 
 
 def _hold_inter_chunk_delay(

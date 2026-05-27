@@ -28,7 +28,6 @@ DEFAULT_MANIFESTS = (
 
 @dataclasses.dataclass(frozen=True)
 class Args:
-    old_good_dir: Path | None = None
     moved_robot_dir: Path | None = None
     current_raw_dir: Path = Path("yam_data/raw")
     manifests: tuple[Path, ...] = DEFAULT_MANIFESTS
@@ -47,11 +46,9 @@ class Args:
 def main(args: Args) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     workspace_root = repo_root.parent
-    groups = {"current_recollect_20260525": args.current_raw_dir}
-    if args.old_good_dir is not None:
-        groups["old_good_20260515"] = args.old_good_dir
+    groups = {"current_raw": args.current_raw_dir}
     if args.moved_robot_dir is not None:
-        groups["moved_robot_20260525"] = args.moved_robot_dir
+        groups["comparison_raw"] = args.moved_robot_dir
 
     issues: list[dict[str, Any]] = []
     report = {
