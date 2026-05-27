@@ -40,9 +40,9 @@ def main(args: Args) -> None:
 
 
 def validate_episode(args: Args) -> dict[str, Any]:
+    episode_metadata = mcap_episode.read_episode_metadata(args.episode_dir)
+    recording_context = mcap_episode.read_recording_context(args.episode_dir)
     episode = mcap_episode.read_episode(args.episode_dir, decode_images=True)
-    metadata = mcap_episode.pistream_mcap.read_mcap_metadata(args.episode_dir)
-    camera_config = _decode_camera_config(metadata)
     row_timing = _timestamp_stats_ns(episode.timestamps_ns, fps=args.expected_row_fps)
     camera_timing = {
         camera_name: _timestamp_stats_ns(timestamps_ns, fps=args.expected_camera_fps)
@@ -67,6 +67,7 @@ def validate_episode(args: Args) -> dict[str, Any]:
     }
     dynamic_demo = _is_dynamic_gripper_demo(args.episode_dir)
     strict_failures = _strict_failures(
+        recording_context=recording_context,
         row_timing=row_timing,
         camera_timing=camera_timing,
         image_summary=image_summary,
@@ -82,10 +83,12 @@ def validate_episode(args: Args) -> dict[str, Any]:
         "rows": int(state.shape[0]),
         "expected_row_fps": args.expected_row_fps,
         "expected_camera_fps": args.expected_camera_fps,
-        "mcap_metadata": metadata,
-        "camera_requested": camera_config.get("requested", {}),
-        "camera_actual_modes": camera_config.get("actual_modes", {}),
-        "camera_paths": camera_config.get("camera_paths", {}),
+        "episode_metadata": episode_metadata,
+        "recording_context": recording_context,
+        "recording_context_present": bool(recording_context),
+        "camera_requested": recording_context.get("camera_requested", {}),
+        "camera_actual_modes": recording_context.get("camera_actual_modes", {}),
+        "camera_paths": recording_context.get("camera_paths", {}),
         "row_timing": row_timing,
         "camera_timing": camera_timing,
         "camera_frame_reuse": episode.camera_frame_reuse or {},
@@ -100,15 +103,6 @@ def validate_episode(args: Args) -> dict[str, Any]:
         "strict_failures": strict_failures,
         "strict_pass": not strict_failures,
     }
-
-
-def _decode_camera_config(metadata: dict[str, str]) -> dict[str, Any]:
-    raw = metadata.get("camera_config", "{}")
-    try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"raw": raw}
-    return decoded if isinstance(decoded, dict) else {"raw": decoded}
 
 
 def _timestamp_stats_ns(timestamps_ns: np.ndarray, *, fps: float) -> dict[str, float | int]:
@@ -251,6 +245,7 @@ def _matrix_abs_stats(matrix: np.ndarray) -> dict[str, float]:
 
 def _strict_failures(
     *,
+    recording_context: dict[str, Any],
     row_timing: dict[str, float | int],
     camera_timing: dict[str, dict[str, float | int]],
     image_summary: dict[str, dict[str, Any]],
@@ -261,6 +256,8 @@ def _strict_failures(
     expected_camera_fps: float,
 ) -> list[str]:
     failures = []
+    if not recording_context:
+        failures.append("missing recording_context.json sidecar")
     expected_row_dt_s = 1.0 / expected_row_fps
     row_median_dt_s = float(row_timing["median_dt_s"])
     if _relative_error(row_median_dt_s, expected_row_dt_s) > 0.25:

@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+import subprocess
 import sys
 
+from mcap.reader import make_reader
 import numpy as np
 import pytest
 
@@ -13,6 +15,7 @@ from examples.yam_real import mcap_episode
 from examples.yam_real import read_yam_encoders
 from examples.yam_real import validate_yam_recording
 from openpi import transforms
+from openpi.pistream.proto import descriptor_pb2
 from openpi.policies import yam_policy
 from openpi.shared import jpeg_transport
 from openpi.shared import normalize
@@ -42,23 +45,6 @@ def test_yam_delta_action_mask_keeps_grippers_absolute() -> None:
     np.testing.assert_allclose(transformed["actions"][:, data_regression.GRIPPER_DIMS], original_grippers)
 
 
-def test_synthetic_npz_canonical_round_trip(tmp_path: Path) -> None:
-    expected = data_regression.make_synthetic_episode()
-    episode_dir = data_regression.write_npz_fixture(expected, tmp_path / "npz_episode")
-
-    actual = data_regression.load_npz_episode(episode_dir)
-    diff = data_regression.compare_canonical_episodes(expected, actual)
-    summary = data_regression.summarize_episode(actual)
-
-    assert diff == {"max_state_abs_error": 0.0, "max_action_abs_error": 0.0}
-    assert summary["warnings"] == []
-    assert summary["gripper"]["action"]["left_gripper"]["close_count"] > 0
-    assert summary["gripper"]["action"]["right_gripper"]["open_count"] > 0
-    assert summary["arm_joints"]["action"]["abs_max"] > 0
-    assert "left_waist" in summary["action_stats_by_name"]
-    assert summary["timing"]["median_dt_s"] == 0.02
-
-
 def test_synthetic_mcap_canonical_round_trip(tmp_path: Path) -> None:
     expected = data_regression.make_synthetic_episode()
     episode_dir = data_regression.write_mcap_fixture(expected, tmp_path / "mcap_episode")
@@ -69,6 +55,160 @@ def test_synthetic_mcap_canonical_round_trip(tmp_path: Path) -> None:
 
     assert diff == {"max_state_abs_error": 0.0, "max_action_abs_error": 0.0}
     assert summary["warnings"] == []
+
+
+def test_mcap_writer_uses_monopi_pistream_contract(tmp_path: Path) -> None:
+    expected = data_regression.make_synthetic_episode(num_frames=6)
+    episode_dir = data_regression.write_mcap_fixture(expected, tmp_path / "mcap_contract")
+
+    assert sorted(path.name for path in episode_dir.glob("episode_part*.mcap")) == [
+        "episode_part0.mcap",
+        "episode_part1.mcap",
+        "episode_part2.mcap",
+        "episode_part3.mcap",
+    ]
+    metadata = mcap_episode.read_episode_metadata(episode_dir)
+    assert metadata["format"] == mcap_episode.CANONICAL_FORMAT
+    assert metadata["mcap_layout"] == "monopi_pistream_sharded"
+
+    topics_by_shard: dict[int, set[str]] = {}
+    descriptors_by_shard: dict[int, descriptor_pb2.PiStreamDescriptor] = {}
+    schema_names: set[str] = set()
+    for shard_index in range(mcap_episode.EXPECTED_SHARD_COUNT):
+        path = episode_dir / f"episode_part{shard_index}.mcap"
+        assert _mcap_metadata_names(path) == []
+        topics: set[str] = set()
+        with path.open("rb") as file:
+            reader = make_reader(file)
+            for schema, channel, message in reader.iter_messages(log_time_order=False):
+                if schema is not None:
+                    schema_names.add(schema.name)
+                topics.add(channel.topic)
+                if channel.topic == mcap_episode.pistream_mcap.PI_STREAM_DESCRIPTOR_TOPIC:
+                    assert message.log_time == 0
+                    assert message.publish_time == 0
+                    assert message.sequence == 0
+                    descriptor = descriptor_pb2.PiStreamDescriptor()
+                    descriptor.ParseFromString(message.data)
+                    descriptors_by_shard[shard_index] = descriptor
+                else:
+                    assert channel.topic.startswith(mcap_episode.pistream_mcap.PI_STREAM_FRAME_PREFIX)
+        topics_by_shard[shard_index] = topics
+
+    expected_light_topics = {
+        mcap_episode.pistream_mcap.PI_STREAM_DESCRIPTOR_TOPIC,
+        *(_topic_for_field(field) for field in mcap_episode._required_state_action_fields()),  # noqa: SLF001
+        _topic_for_field(mcap_episode.ACTIVE_AGENT_FIELD),
+        _topic_for_field(mcap_episode.ACTION_START_FIELD),
+        _topic_for_field(mcap_episode.ACTION_SNAPSHOT_FIELD),
+    }
+    assert topics_by_shard[0] == expected_light_topics
+    for shard_index, field in enumerate(mcap_episode.CAMERA_FIELD_MAP.values(), start=1):
+        assert topics_by_shard[shard_index] == {
+            mcap_episode.pistream_mcap.PI_STREAM_DESCRIPTOR_TOPIC,
+            _topic_for_field(field),
+        }
+
+    assert all(
+        schema_name.startswith(("monopi.pi_stream.", "google.protobuf."))
+        for schema_name in schema_names
+    )
+    assert "monopi.pi_stream.PiStreamDescriptor" in schema_names
+    assert "monopi.pi_stream.PiStreamSnapshotRef" in schema_names
+    assert "monopi.pi_stream.VideoFrame" in schema_names
+
+    snapshot_descriptor = _descriptor_field(descriptors_by_shard[0], mcap_episode.ACTION_SNAPSHOT_FIELD)
+    expected_snapshot_index = mcap_episode._snapshot_index(mcap_episode._snapshot_fields())  # noqa: SLF001
+    assert [
+        (entry.publisher_id, entry.key, entry.index)
+        for entry in snapshot_descriptor.encoding.snapshot_ref.field_index_map
+    ] == [
+        (field.publisher_id, field.key, index)
+        for field, index in sorted(expected_snapshot_index.items(), key=lambda item: item[1])
+    ]
+
+    for shard_index, field in enumerate(mcap_episode.CAMERA_FIELD_MAP.values(), start=1):
+        descriptor_field = _descriptor_field(descriptors_by_shard[shard_index], field)
+        video = descriptor_field.encoding.video
+        compressed = video.compressed_encoding
+        assert video.width == 640
+        assert video.height == 480
+        assert video.pix_fmt == "yuv420p"
+        assert compressed.codec == "h264"
+        assert compressed.encoder == "libx264"
+        assert compressed.fps == 30
+        assert [(option.name, option.value) for option in compressed.options] == [
+            ("crf", "19"),
+            ("gop_size", "4"),
+            ("bf", "0"),
+        ]
+
+
+def test_mcap_reader_rejects_pre_cutover_episode_without_sidecar(tmp_path: Path) -> None:
+    episode = data_regression.make_synthetic_episode(num_frames=4)
+    episode_dir = data_regression.write_mcap_fixture(episode, tmp_path / "missing_sidecar")
+    (episode_dir / mcap_episode.EPISODE_METADATA_FILENAME).unlink()
+
+    assert not mcap_episode.is_mcap_episode(episode_dir)
+    with pytest.raises(RuntimeError, match="Pre-cutover OpenPI/YAM MCAP episodes are unsupported"):
+        mcap_episode.read_episode(episode_dir, decode_images=False)
+
+
+def test_mcap_fixture_monopi_reader_smoke(tmp_path: Path) -> None:
+    monopi_root = Path("/home/pi-sj/code/monopi")
+    if not monopi_root.exists():
+        pytest.skip("MonoPI checkout is not available")
+
+    expected = data_regression.make_synthetic_episode(num_frames=6)
+    episode_dir = data_regression.write_mcap_fixture(expected, tmp_path / "monopi_smoke")
+    featurizer_output_dir = tmp_path / "monopi_featurizer"
+    script = f"""
+import datetime
+from pathlib import Path
+import sys
+
+sys.path.insert(0, {str(monopi_root)!r})
+
+from monopi.data.episode.validation import validator as monopi_validator
+import monopi.data.pi_stream.py.mcap_io as monopi_mcap_io
+from monopi.data_utils.datasets import featurizer as monopi_featurizer_config
+from monopi.data_utils.datasets import source as monopi_source
+from monopi.data_utils.featurization import mcap_featurizer
+from monopi.data_utils.saver import canonical_mcap_reader
+
+episode_dir = Path({str(episode_dir)!r})
+with monopi_mcap_io.MCAPShardedReader(episode_dir) as reader:
+    assert len(reader.stream_descriptor) > 0
+    raw_records = list(reader.read_synchronized_records(decode_videos=False))
+assert len(raw_records) == {expected.num_frames}
+
+with canonical_mcap_reader.MCAPCanonicalStepReader(episode_dir) as reader:
+    canonical_records = list(reader.read_synchronized_records(decode_videos=False))
+assert len(canonical_records) == {expected.num_frames}
+
+monopi_validator.validate(episode_dir, run_in_subprocess=False, ignore_frequency=True)
+config = monopi_featurizer_config.FeaturizerConfig(
+    scratch_dir=Path({str(featurizer_output_dir / "scratch")!r}),
+    deploy_dir=Path({str(featurizer_output_dir / "deploy" / "shards")!r}),
+    generate_segment_spec=True,
+)
+featurizer = mcap_featurizer.McapFeaturizer(config, video_encoding=False, strict_index_checks=False)
+manifest = featurizer.featurize_with_handling(
+    monopi_source.EpisodeSource(
+        episode_id="2026-05-26-yam-smoke",
+        path=str(episode_dir),
+        metadata={{
+            "collection_start_timestamp": datetime.datetime(2026, 5, 26, tzinfo=datetime.UTC),
+            "robot_name": "yam",
+        }},
+    )
+)
+assert manifest.segments
+"""
+    result = subprocess.run([sys.executable, "-c", script], check=False, capture_output=True, text=True)
+    if result.returncode != 0 and ("ModuleNotFoundError" in result.stderr or "ImportError" in result.stderr):
+        pytest.skip(f"MonoPI dependencies are not available in this environment: {result.stderr}")
+    assert result.returncode == 0, result.stderr
 
 
 def test_mcap_rows_can_reuse_latest_30hz_camera_frame(tmp_path: Path) -> None:
@@ -162,6 +302,24 @@ def test_validate_yam_recording_rejects_row_timing_mismatch(tmp_path: Path) -> N
     assert any("row median dt" in failure for failure in summary["strict_failures"])
 
 
+def test_validate_yam_recording_strict_rejects_missing_recording_context(tmp_path: Path) -> None:
+    episode = data_regression.make_synthetic_episode(num_frames=50)
+    episode_dir = data_regression.write_mcap_fixture(episode, tmp_path / "missing_context")
+
+    summary = validate_yam_recording.validate_episode(
+        validate_yam_recording.Args(
+            episode_dir=episode_dir,
+            expected_row_fps=50.0,
+            expected_camera_fps=50.0,
+            strict=True,
+            output_dir=tmp_path / "validation",
+        )
+    )
+
+    assert not summary["strict_pass"]
+    assert "missing recording_context.json sidecar" in summary["strict_failures"]
+
+
 def test_mcap_decode_preserves_rgb_channel_order(tmp_path: Path) -> None:
     episode = data_regression.make_synthetic_episode()
     episode_dir = _write_mcap_fixture_with_rgb_values(
@@ -187,6 +345,15 @@ def test_mcap_reader_rejects_missing_shard(tmp_path: Path) -> None:
     (episode_dir / "episode_part1.mcap").unlink()
 
     with pytest.raises(FileNotFoundError, match="missing shard"):
+        mcap_episode.read_episode(episode_dir, decode_images=False)
+
+
+def test_mcap_reader_rejects_unexpected_extra_shard(tmp_path: Path) -> None:
+    episode = data_regression.make_synthetic_episode()
+    episode_dir = data_regression.write_mcap_fixture(episode, tmp_path / "mcap_extra_shard")
+    (episode_dir / "episode_part4.mcap").write_bytes(b"")
+
+    with pytest.raises(RuntimeError, match="unexpected shard"):
         mcap_episode.read_episode(episode_dir, decode_images=False)
 
 
@@ -229,29 +396,21 @@ def test_mcap_snapshot_validation_reports_missing_camera_sequence(tmp_path: Path
         )
 
 
-def test_npz_to_lerobot_conversion_preserves_gripper_values(tmp_path: Path, monkeypatch) -> None:
-    expected = data_regression.make_synthetic_episode()
+def test_lerobot_conversion_rejects_legacy_npz_raw_format(tmp_path: Path, monkeypatch) -> None:
     raw_dir = tmp_path / "raw"
-    data_regression.write_npz_fixture(expected, raw_dir / "episode_000")
-    lerobot_home = tmp_path / "lerobot"
-    monkeypatch.setattr(convert_yam_data_to_lerobot, "HF_LEROBOT_HOME", lerobot_home)
+    _write_legacy_npz_marker(raw_dir / "episode_000")
+    monkeypatch.setattr(convert_yam_data_to_lerobot, "HF_LEROBOT_HOME", tmp_path / "lerobot")
 
-    convert_yam_data_to_lerobot.main(
-        convert_yam_data_to_lerobot.Args(
-            raw_dir=raw_dir,
-            repo_id="local/yam_regression_npz",
-            raw_format="npz",
-            image_writer_processes=0,
-            image_writer_threads=0,
+    with pytest.raises(ValueError, match="only supports the canonical MCAP raw format"):
+        convert_yam_data_to_lerobot.main(
+            convert_yam_data_to_lerobot.Args(
+                raw_dir=raw_dir,
+                repo_id="local/yam_regression_npz",
+                raw_format="npz",
+                image_writer_processes=0,
+                image_writer_threads=0,
+            )
         )
-    )
-
-    actual = data_regression.load_lerobot_episode(
-        "local/yam_regression_npz",
-        root=lerobot_home / "local/yam_regression_npz",
-        episode_index=0,
-    )
-    data_regression.compare_canonical_episodes(expected, actual)
 
 
 def test_mcap_to_lerobot_conversion_preserves_gripper_values(tmp_path: Path, monkeypatch) -> None:
@@ -351,28 +510,17 @@ def test_mcap_episode_manifest_selection_preserves_order_and_rejects_bad_entries
         convert_yam_data_to_lerobot._episode_dirs(raw_dir, manifest, "mcap")  # noqa: SLF001
 
 
-def test_npz_to_lerobot_conversion_rejects_timing_mismatch(tmp_path: Path, monkeypatch) -> None:
-    expected = data_regression.make_synthetic_episode()
-    bad_episode = data_regression.CanonicalEpisode(
-        source_path=expected.source_path,
-        source_format=expected.source_format,
-        task=expected.task,
-        fps=50.0,
-        state=expected.state,
-        action=expected.action,
-        timestamps_s=np.arange(expected.num_frames, dtype=np.float64) * 0.06,
-        image_counts=expected.image_counts,
-    )
+def test_lerobot_conversion_auto_rejects_legacy_npz_directories(tmp_path: Path, monkeypatch) -> None:
     raw_dir = tmp_path / "raw"
-    data_regression.write_npz_fixture(bad_episode, raw_dir / "episode_000")
+    _write_legacy_npz_marker(raw_dir / "episode_000")
     monkeypatch.setattr(convert_yam_data_to_lerobot, "HF_LEROBOT_HOME", tmp_path / "lerobot")
 
-    with pytest.raises(RuntimeError, match="Timing mismatch"):
+    with pytest.raises(FileNotFoundError, match="No recorded YAM episodes"):
         convert_yam_data_to_lerobot.main(
             convert_yam_data_to_lerobot.Args(
                 raw_dir=raw_dir,
-                repo_id="local/yam_regression_bad_timing",
-                raw_format="npz",
+                repo_id="local/yam_regression_npz_auto",
+                raw_format="auto",
                 image_writer_processes=0,
                 image_writer_threads=0,
             )
@@ -552,6 +700,7 @@ def _write_mcap_fixture_with_rgb_values(
             )
     finally:
         writer.close()
+    _write_fixture_recording_context(episode_dir)
     return episode_dir
 
 
@@ -564,19 +713,6 @@ def _write_mcap_fixture_with_50hz_rows_30hz_cameras(
         task=episode.task,
         fps=episode.fps,
         camera_fps=30.0,
-        camera_config={
-            "requested": {"frame_size": [640, 480], "fps": 30, "pixel_format": "MJPG"},
-            "actual_modes": {
-                camera_name: {
-                    "actual_fps": 30.0,
-                    "actual_format": {"width": 640, "height": 480, "pixel_format": "MJPG"},
-                    "driver": "fixture",
-                    "bus_info": "fixture",
-                }
-                for camera_name in data_regression.CAMERA_NAMES
-            },
-            "camera_paths": {camera_name: f"/dev/null/{camera_name}" for camera_name in data_regression.CAMERA_NAMES},
-        },
     )
     try:
         for frame_idx in range(episode.num_frames):
@@ -603,6 +739,7 @@ def _write_mcap_fixture_with_50hz_rows_30hz_cameras(
             )
     finally:
         writer.close()
+    _write_fixture_recording_context(episode_dir)
     return episode_dir
 
 
@@ -612,6 +749,57 @@ def _gradient_frame(sequence_id: int, camera_idx: int) -> np.ndarray:
     image[:, :, 1] = np.linspace(0, 255, 640, dtype=np.uint8)[None, :]
     image[:, :, 2] = np.linspace(0, 255, 480, dtype=np.uint8)[:, None]
     return np.ascontiguousarray(image)
+
+
+def _write_legacy_npz_marker(episode_dir: Path) -> Path:
+    episode_dir.mkdir(parents=True, exist_ok=False)
+    np.savez_compressed(
+        episode_dir / "episode.npz",
+        state=np.zeros((1, 14), dtype=np.float32),
+        action=np.zeros((1, 14), dtype=np.float32),
+        timestamp=np.asarray([0.0], dtype=np.float64),
+    )
+    return episode_dir
+
+
+def _write_fixture_recording_context(episode_dir: Path) -> None:
+    mcap_episode.write_recording_context(
+        episode_dir,
+        {
+            "camera_requested": {"frame_size": [640, 480], "fps": 30, "pixel_format": "MJPG"},
+            "camera_actual_modes": {
+                camera_name: {
+                    "actual_fps": 30.0,
+                    "actual_format": {"width": 640, "height": 480, "pixel_format": "MJPG"},
+                    "driver": "fixture",
+                    "bus_info": "fixture",
+                }
+                for camera_name in data_regression.CAMERA_NAMES
+            },
+            "camera_paths": {camera_name: f"/dev/null/{camera_name}" for camera_name in data_regression.CAMERA_NAMES},
+            "hardware_backend": "fixture",
+        },
+    )
+
+
+def _mcap_metadata_names(path: Path) -> list[str]:
+    with path.open("rb") as file:
+        reader = make_reader(file)
+        return [metadata.name for metadata in reader.iter_metadata()]
+
+
+def _topic_for_field(field: mcap_episode.pistream_mcap.FieldKey) -> str:
+    return f"{mcap_episode.pistream_mcap.PI_STREAM_FRAME_PREFIX}{field.publisher_id}/{field.key}"
+
+
+def _descriptor_field(
+    descriptor: descriptor_pb2.PiStreamDescriptor,
+    field: mcap_episode.pistream_mcap.FieldKey,
+) -> descriptor_pb2.FieldDescriptor:
+    for descriptor_field in descriptor.fields:
+        if descriptor_field.publisher_id == field.publisher_id and descriptor_field.key == field.key:
+            return descriptor_field
+    raise AssertionError(f"Missing descriptor field {field.publisher_id}/{field.key}")
 
 
 def _snapshot_refs(sequence_id: int = 1) -> dict[mcap_episode.pistream_mcap.FieldKey, mcap_episode.FieldValueRef]:

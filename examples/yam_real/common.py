@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 import contextlib
 import dataclasses
-import json
 import os
 from pathlib import Path
 import sys
@@ -56,31 +55,6 @@ def ensure_i2rt_importable() -> None:
         if (candidate / "i2rt").is_dir():
             sys.path.insert(0, str(candidate))
             return
-
-
-@dataclasses.dataclass(frozen=True)
-class EpisodeManifest:
-    task: str
-    fps: float
-    created_at: float
-    state_order: tuple[str, ...]
-    action_space: str
-    gripper_convention: str
-    camera_paths: dict[str, str]
-    leader_channels: dict[str, str]
-    follower_channels: dict[str, str]
-    num_frames: int
-    row_fps: float | None = None
-    camera_fps: float | None = None
-    camera_config: dict[str, Any] | None = None
-    camera_actual_modes: dict[str, Any] | None = None
-    camera_capture_mode: str = "blocking"
-
-    def write(self, path: Path) -> None:
-        payload = dataclasses.asdict(self)
-        if payload["row_fps"] is None:
-            payload["row_fps"] = self.fps
-        path.write_text(json.dumps(payload, indent=2))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -704,19 +678,6 @@ def clip_bimanual_delta(
     max_delta = np.full((14,), max_arm_step_rad, dtype=np.float32)
     max_delta[[6, 13]] = max_gripper_step
     return previous + np.clip(target - previous, -max_delta, max_delta)
-
-
-def load_episode(episode_dir: Path) -> tuple[dict, dict[str, np.ndarray]]:
-    manifest_path = episode_dir / "manifest.json"
-    arrays_path = episode_dir / "episode.npz"
-    if not manifest_path.exists():
-        raise FileNotFoundError(manifest_path)
-    if not arrays_path.exists():
-        raise FileNotFoundError(arrays_path)
-    manifest = json.loads(manifest_path.read_text())
-    with np.load(arrays_path, allow_pickle=True) as data:
-        arrays = {key: data[key] for key in data.files}
-    return manifest, arrays
 
 
 @contextlib.contextmanager

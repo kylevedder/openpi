@@ -13,6 +13,7 @@ import numpy as np
 import tyro
 
 from examples.yam_real import common
+from examples.yam_real import mcap_episode
 from examples.yam_real import process_runtime
 from examples.yam_real import teleop
 
@@ -338,10 +339,17 @@ def main(args: Args) -> None:
             camera_fps=args.camera_fps,
             image_width=args.camera_width,
             image_height=args.camera_height,
-            camera_config={
-                "requested": camera_config.as_manifest(),
-                "actual_modes": camera_actual_modes,
+        )
+        mcap_episode.write_recording_context(
+            episode_dir,
+            {
+                "args": dataclasses.asdict(args),
+                "camera_requested": camera_config.as_manifest(),
+                "camera_actual_modes": camera_actual_modes,
                 "camera_paths": common.CAMERA_PATHS,
+                "created_at_unix_s": time.time(),
+                "process_ids": runtime.process_ids,
+                "hardware_backend": "multiprocessing",
             },
         )
         reset_episode_buffers()

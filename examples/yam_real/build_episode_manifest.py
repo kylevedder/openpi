@@ -4,10 +4,9 @@ import dataclasses
 from pathlib import Path
 import time
 
-import numpy as np
 import tyro
 
-from examples.yam_real import common
+from examples.yam_real import data_regression
 
 
 @dataclasses.dataclass
@@ -23,19 +22,9 @@ def main(args: Args) -> None:
 
     selected: list[tuple[str, int]] = []
     skipped: list[tuple[str, int]] = []
-    for episode_dir in sorted(path for path in args.raw_dir.iterdir() if path.is_dir()):
-        if not (episode_dir / "manifest.json").exists():
-            continue
-        _, arrays = common.load_episode(episode_dir)
-        states = np.asarray(arrays["state"], dtype=np.float32)
-        actions = np.asarray(arrays["action"], dtype=np.float32)
-        image_paths = arrays["image_paths"]
-        if states.shape != actions.shape or states.shape[-1] != 14:
-            raise RuntimeError(f"Bad state/action shapes in {episode_dir}: {states.shape}, {actions.shape}")
-        if len(image_paths) != len(states):
-            raise RuntimeError(f"Image path count mismatch in {episode_dir}: {len(image_paths)} vs {len(states)}")
-
-        num_frames = int(states.shape[0])
+    for episode_dir in data_regression.discover_episodes(args.raw_dir, source_format="mcap"):
+        episode = data_regression.load_mcap_episode(episode_dir)
+        num_frames = episode.num_frames
         target = selected if num_frames >= args.min_frames else skipped
         target.append((episode_dir.name, num_frames))
 

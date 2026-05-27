@@ -4,9 +4,8 @@ import dataclasses
 import json
 from pathlib import Path
 import time
-from typing import Any, Literal
+from typing import Literal
 
-import cv2
 import numpy as np
 import tyro
 
@@ -16,9 +15,9 @@ GRIPPER_DIMS = (6, 13)
 ARM_DIMS = tuple(dim for dim in range(14) if dim not in GRIPPER_DIMS)
 CAMERA_NAMES = common.CAMERA_NAMES
 DIM_NAMES = common.STATE_ORDER
-DEFAULT_OLD_GOOD_DIR = Path("yam_data/archive/raw_before_moved_robot_20260525_145623")
 DEFAULT_CURRENT_RAW_DIR = Path("yam_data/raw")
 DEFAULT_LOG_DIR = Path("yam_data/logs/data_regression")
+SourceFormat = Literal["auto", "mcap", "lerobot"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,12 +43,12 @@ class CanonicalEpisode:
 @dataclasses.dataclass(frozen=True)
 class Args:
     inputs: tuple[Path, ...] = ()
-    old_good_dir: Path | None = DEFAULT_OLD_GOOD_DIR
+    old_good_dir: Path | None = None
     current_raw_dir: Path | None = DEFAULT_CURRENT_RAW_DIR
     lerobot_repo_id: str | None = None
     lerobot_root: Path | None = None
     lerobot_episode_index: int = 0
-    source_format: Literal["auto", "npz", "mcap", "lerobot"] = "auto"
+    source_format: SourceFormat = "auto"
     output_dir: Path = DEFAULT_LOG_DIR
     max_episodes_per_source: int | None = None
     strict: bool = False
@@ -112,15 +111,13 @@ def main(args: Args) -> None:
 def load_canonical_episode(
     path: Path,
     *,
-    source_format: Literal["auto", "npz", "mcap", "lerobot"] = "auto",
+    source_format: SourceFormat = "auto",
     lerobot_repo_id: str | None = None,
     lerobot_root: Path | None = None,
     lerobot_episode_index: int = 0,
 ) -> CanonicalEpisode:
     path = Path(path)
     resolved_format = resolve_source_format(path, source_format, lerobot_repo_id=lerobot_repo_id)
-    if resolved_format == "npz":
-        return load_npz_episode(path)
     if resolved_format == "mcap":
         return load_mcap_episode(path)
     if resolved_format == "lerobot":
@@ -132,16 +129,16 @@ def load_canonical_episode(
 
 def resolve_source_format(
     path: Path,
-    requested: Literal["auto", "npz", "mcap", "lerobot"],
+    requested: SourceFormat,
     *,
     lerobot_repo_id: str | None = None,
-) -> Literal["npz", "mcap", "lerobot"]:
+) -> Literal["mcap", "lerobot"]:
+    if requested not in ("auto", "mcap", "lerobot"):
+        raise ValueError(f"Unsupported YAM source format: {requested}")
     if requested != "auto":
         return requested
     if lerobot_repo_id is not None:
         return "lerobot"
-    if (path / "episode.npz").exists():
-        return "npz"
     if any(path.glob("episode_part*.mcap")):
         return "mcap"
     if (path / "meta").exists() and (path / "data").exists():
@@ -149,12 +146,12 @@ def resolve_source_format(
     raise ValueError(f"Could not infer YAM episode format for {path}")
 
 
-def discover_episodes(path: Path, *, source_format: Literal["auto", "npz", "mcap", "lerobot"] = "auto") -> list[Path]:
+def discover_episodes(path: Path, *, source_format: SourceFormat = "auto") -> list[Path]:
+    if source_format not in ("auto", "mcap", "lerobot"):
+        raise ValueError(f"Unsupported YAM source format: {source_format}")
     if not path.exists():
         return []
     if path.is_file():
-        return [path]
-    if source_format in ("auto", "npz") and (path / "episode.npz").exists():
         return [path]
     if source_format in ("auto", "mcap") and any(path.glob("episode_part*.mcap")):
         return [path]
@@ -165,41 +162,9 @@ def discover_episodes(path: Path, *, source_format: Literal["auto", "npz", "mcap
     for child in sorted(path.iterdir()):
         if not child.is_dir():
             continue
-        if (source_format in ("auto", "npz") and (child / "episode.npz").exists()) or (
-            source_format in ("auto", "mcap") and any(child.glob("episode_part*.mcap"))
-        ):
+        if source_format in ("auto", "mcap") and any(child.glob("episode_part*.mcap")):
             episodes.append(child)
     return episodes
-
-
-def load_npz_episode(episode_dir: Path) -> CanonicalEpisode:
-    manifest, arrays = common.load_episode(episode_dir)
-    state = _as_float_matrix(arrays["state"], "state", episode_dir)
-    action = _as_float_matrix(arrays["action"], "action", episode_dir)
-    _validate_state_action_shapes(state, action, episode_dir)
-
-    timestamps_s = np.asarray(arrays.get("timestamp", np.arange(len(state))), dtype=np.float64)
-    image_paths = arrays.get("image_paths")
-    image_counts = _image_counts_from_npz(image_paths)
-    camera_timestamps_s, camera_frame_reuse = _camera_timestamps_from_npz_metadata(
-        arrays.get("camera_frame_metadata"),
-        num_rows=len(state),
-    )
-    fps = float(manifest.get("row_fps", manifest.get("fps", 0.0)))
-    return CanonicalEpisode(
-        source_path=episode_dir,
-        source_format="npz",
-        task=str(manifest.get("task", "")),
-        fps=fps,
-        state=state,
-        action=action,
-        timestamps_s=timestamps_s,
-        image_counts=image_counts,
-        row_fps=fps,
-        camera_fps=float(manifest["camera_fps"]) if manifest.get("camera_fps") is not None else None,
-        camera_timestamps_s=camera_timestamps_s,
-        camera_frame_reuse=camera_frame_reuse,
-    )
 
 
 def load_mcap_episode(episode_dir: Path) -> CanonicalEpisode:
@@ -420,44 +385,6 @@ def make_synthetic_episode(num_frames: int = 6) -> CanonicalEpisode:
     )
 
 
-def write_npz_fixture(episode: CanonicalEpisode, episode_dir: Path) -> Path:
-    episode_dir.mkdir(parents=True, exist_ok=False)
-    image_paths = []
-    for camera_name in CAMERA_NAMES:
-        (episode_dir / "images" / camera_name).mkdir(parents=True, exist_ok=True)
-    for frame_idx in range(episode.num_frames):
-        frame_paths = {}
-        for camera_idx, camera_name in enumerate(CAMERA_NAMES):
-            rel_path = Path("images") / camera_name / f"{frame_idx:06d}.jpg"
-            image = np.full((480, 640, 3), frame_idx * 10 + camera_idx, dtype=np.uint8)
-            if not cv2.imwrite(str(episode_dir / rel_path), image):
-                raise RuntimeError(f"Failed to write fixture image {episode_dir / rel_path}")
-            frame_paths[camera_name] = str(rel_path)
-        image_paths.append(frame_paths)
-
-    manifest = common.EpisodeManifest(
-        task=episode.task,
-        fps=episode.fps,
-        created_at=0.0,
-        state_order=tuple(common.STATE_ORDER),
-        action_space=common.ACTION_SPACE,
-        gripper_convention=common.GRIPPER_CONVENTION,
-        camera_paths={camera_name: f"/dev/null/{camera_name}" for camera_name in CAMERA_NAMES},
-        leader_channels=dict(common.LEADER_CHANNELS),
-        follower_channels=dict(common.FOLLOWER_CHANNELS),
-        num_frames=episode.num_frames,
-    )
-    manifest.write(episode_dir / "manifest.json")
-    np.savez_compressed(
-        episode_dir / "episode.npz",
-        state=episode.state.astype(np.float32),
-        action=episode.action.astype(np.float32),
-        timestamp=episode.timestamps_s.astype(np.float64),
-        image_paths=np.asarray(image_paths, dtype=object),
-    )
-    return episode_dir
-
-
 def write_mcap_fixture(episode: CanonicalEpisode, episode_dir: Path) -> Path:
     from examples.yam_real import mcap_episode
 
@@ -506,82 +433,6 @@ def _default_and_user_paths(args: Args) -> list[Path]:
     if args.current_raw_dir is not None:
         paths.append(args.current_raw_dir)
     return paths
-
-
-def _image_counts_from_npz(image_paths: np.ndarray | None) -> dict[str, int]:
-    counts = dict.fromkeys(CAMERA_NAMES, 0)
-    if image_paths is None:
-        return counts
-    for entry in image_paths:
-        paths = entry.item() if hasattr(entry, "item") else entry
-        for camera_name in CAMERA_NAMES:
-            if camera_name in paths:
-                counts[camera_name] += 1
-    return counts
-
-
-def _camera_timestamps_from_npz_metadata(
-    metadata_array: np.ndarray | None,
-    *,
-    num_rows: int,
-) -> tuple[dict[str, np.ndarray], dict[str, dict[str, int]]]:
-    if metadata_array is None:
-        return {}, {}
-
-    timestamps: dict[str, list[float]] = {camera_name: [] for camera_name in CAMERA_NAMES}
-    row_counts: dict[str, int] = dict.fromkeys(CAMERA_NAMES, 0)
-    last_sequence: dict[str, int] = {}
-    for entry in metadata_array:
-        metadata = entry.item() if hasattr(entry, "item") else entry
-        if not isinstance(metadata, dict):
-            continue
-        for camera_name in CAMERA_NAMES:
-            camera_metadata = metadata.get(camera_name)
-            if not isinstance(camera_metadata, dict):
-                continue
-            row_counts[camera_name] += 1
-            sequence_index = _metadata_int(camera_metadata.get("sequence_index"))
-            capture_time_s = _metadata_float(camera_metadata.get("capture_time_s"))
-            if capture_time_s is None:
-                continue
-            if sequence_index is None or last_sequence.get(camera_name) != sequence_index:
-                timestamps[camera_name].append(capture_time_s)
-                if sequence_index is not None:
-                    last_sequence[camera_name] = sequence_index
-
-    arrays = {camera_name: np.asarray(values, dtype=np.float64) for camera_name, values in timestamps.items() if values}
-    reuse = {}
-    for camera_name in CAMERA_NAMES:
-        unique_frames = len(arrays.get(camera_name, ()))
-        rows_with_camera = int(row_counts.get(camera_name, 0))
-        if rows_with_camera:
-            reuse[camera_name] = {
-                "rows": rows_with_camera,
-                "unique_frames": unique_frames,
-                "reused_rows": max(0, rows_with_camera - unique_frames),
-                "missing_rows": max(0, num_rows - rows_with_camera),
-            }
-    return arrays, reuse
-
-
-def _metadata_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    with np.errstate(all="ignore"):
-        try:
-            result = float(value)
-        except (TypeError, ValueError):
-            return None
-    return result if np.isfinite(result) else None
-
-
-def _metadata_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _camera_timing_stats(episode: CanonicalEpisode) -> dict[str, dict[str, float | int]]:

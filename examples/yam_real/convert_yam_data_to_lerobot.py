@@ -9,7 +9,6 @@ from pathlib import Path
 import shutil
 from typing import Literal
 
-import cv2
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
@@ -25,7 +24,7 @@ class Args:
     raw_dir: Path = Path("yam_data/raw")
     episode_manifest: Path | None = None
     repo_id: str = "local/yam_bimanual"
-    raw_format: Literal["auto", "npz", "mcap"] = "auto"
+    raw_format: Literal["auto", "mcap"] = "mcap"
     mode: Literal["image", "video"] = "image"
     resume: bool = False
     image_writer_processes: int = 0
@@ -64,7 +63,7 @@ def main(args: Args) -> None:
         print(f"No remaining episodes to convert; dataset is already complete at {output_path}")
         return
 
-    first_episode = data_regression.load_canonical_episode(episode_dirs[0], source_format=args.raw_format)
+    first_episode = data_regression.load_canonical_episode(episode_dirs[0], source_format="mcap")
     fps = round(float(first_episode.fps))
     validation_records = [_validate_episode(episode_dir, args) for episode_dir in episode_dirs]
     validation_record_by_path = {record["source_path"]: record for record in validation_records}
@@ -106,17 +105,16 @@ def main(args: Args) -> None:
         task, states, actions, images_or_paths = _load_episode_for_conversion(episode_dir, args.raw_format)
         if states.shape != actions.shape or states.shape[-1] != 14:
             raise RuntimeError(f"Bad state/action shapes in {episode_dir}: {states.shape}, {actions.shape}")
-        if isinstance(images_or_paths, dict):
-            for camera_name in common.CAMERA_NAMES:
-                if camera_name not in images_or_paths:
-                    raise RuntimeError(f"Missing images for {camera_name} in {episode_dir}")
-                images = images_or_paths[camera_name]
-                if len(images) != len(states):
-                    raise RuntimeError(
-                        f"Image count mismatch for {camera_name} in {episode_dir}: {len(images)} vs {len(states)}"
-                    )
-        elif len(images_or_paths) != len(states):
-            raise RuntimeError(f"Image count mismatch in {episode_dir}: {len(images_or_paths)} vs {len(states)}")
+        if not isinstance(images_or_paths, dict):
+            raise RuntimeError(f"YAM conversion only supports canonical MCAP decoded images: {episode_dir}")
+        for camera_name in common.CAMERA_NAMES:
+            if camera_name not in images_or_paths:
+                raise RuntimeError(f"Missing images for {camera_name} in {episode_dir}")
+            images = images_or_paths[camera_name]
+            if len(images) != len(states):
+                raise RuntimeError(
+                    f"Image count mismatch for {camera_name} in {episode_dir}: {len(images)} vs {len(states)}"
+                )
 
         for idx in range(len(states)):
             frame = {
@@ -149,8 +147,10 @@ def _malloc_trim() -> None:
 
 
 def _episode_dirs(raw_dir: Path, episode_manifest: Path | None, raw_format: str) -> list[Path]:
+    if raw_format not in {"auto", "mcap"}:
+        raise ValueError("YAM LeRobot conversion only supports the canonical MCAP raw format.")
     if episode_manifest is None:
-        return data_regression.discover_episodes(raw_dir, source_format=raw_format)
+        return data_regression.discover_episodes(raw_dir, source_format="mcap")
 
     if not episode_manifest.exists():
         raise FileNotFoundError(episode_manifest)
@@ -168,14 +168,14 @@ def _episode_dirs(raw_dir: Path, episode_manifest: Path | None, raw_format: str)
             raise ValueError(f"Duplicate episode on line {line_number}: {entry}")
         seen.add(entry)
         episode_dir = raw_dir / rel_path
-        if not data_regression.discover_episodes(episode_dir, source_format=raw_format):
-            raise FileNotFoundError(f"Manifest-listed episode is not a {raw_format} YAM episode: {episode_dir}")
+        if not data_regression.discover_episodes(episode_dir, source_format="mcap"):
+            raise FileNotFoundError(f"Manifest-listed episode is not a canonical MCAP YAM episode: {episode_dir}")
         episode_dirs.append(episode_dir)
     return episode_dirs
 
 
 def _validate_episode(episode_dir: Path, args: Args) -> dict:
-    episode = data_regression.load_canonical_episode(episode_dir, source_format=args.raw_format)
+    episode = data_regression.load_canonical_episode(episode_dir, source_format="mcap")
     states = episode.state
     actions = episode.action
     if states.shape != actions.shape or states.shape[-1] != 14:
@@ -213,14 +213,6 @@ def _validate_episode(episode_dir: Path, args: Args) -> dict:
 
 def _load_episode_for_conversion(episode_dir: Path, raw_format: str) -> tuple[str, np.ndarray, np.ndarray, object]:
     resolved_format = data_regression.resolve_source_format(episode_dir, raw_format, lerobot_repo_id=None)
-    if resolved_format == "npz":
-        manifest, arrays = common.load_episode(episode_dir)
-        return (
-            str(manifest["task"]),
-            np.asarray(arrays["state"], dtype=np.float32),
-            np.asarray(arrays["action"], dtype=np.float32),
-            arrays["image_paths"],
-        )
     if resolved_format == "mcap":
         from examples.yam_real import mcap_episode
 
@@ -238,18 +230,12 @@ def _load_episode_for_conversion(episode_dir: Path, raw_format: str) -> tuple[st
 
 
 def _load_images_for_frame(episode_dir: Path, images_or_paths: object, idx: int) -> dict[str, np.ndarray]:
-    if isinstance(images_or_paths, dict):
-        return {
-            "observation.images.cam_high": _hwc_rgb_to_chw(images_or_paths["cam_high"][idx]),
-            "observation.images.cam_left_wrist": _hwc_rgb_to_chw(images_or_paths["cam_left_wrist"][idx]),
-            "observation.images.cam_right_wrist": _hwc_rgb_to_chw(images_or_paths["cam_right_wrist"][idx]),
-        }
-
-    paths = images_or_paths[idx].item() if hasattr(images_or_paths[idx], "item") else images_or_paths[idx]
+    if not isinstance(images_or_paths, dict):
+        raise RuntimeError(f"YAM conversion only supports canonical MCAP decoded images: {episode_dir}")
     return {
-        "observation.images.cam_high": _load_chw_rgb(episode_dir / paths["cam_high"]),
-        "observation.images.cam_left_wrist": _load_chw_rgb(episode_dir / paths["cam_left_wrist"]),
-        "observation.images.cam_right_wrist": _load_chw_rgb(episode_dir / paths["cam_right_wrist"]),
+        "observation.images.cam_high": _hwc_rgb_to_chw(images_or_paths["cam_high"][idx]),
+        "observation.images.cam_left_wrist": _hwc_rgb_to_chw(images_or_paths["cam_left_wrist"][idx]),
+        "observation.images.cam_right_wrist": _hwc_rgb_to_chw(images_or_paths["cam_right_wrist"][idx]),
     }
 
 
@@ -259,14 +245,6 @@ def _image_feature(mode: str) -> dict:
         "shape": (3, 480, 640),
         "names": ["channel", "height", "width"],
     }
-
-
-def _load_chw_rgb(path: Path) -> np.ndarray:
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise FileNotFoundError(path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return _hwc_rgb_to_chw(image)
 
 
 def _hwc_rgb_to_chw(image: np.ndarray) -> np.ndarray:

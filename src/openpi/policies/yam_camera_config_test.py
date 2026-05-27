@@ -8,7 +8,6 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[3]))
 
 from examples.yam_real import common
-from examples.yam_real import data_regression
 from examples.yam_real import record_episode
 
 
@@ -93,22 +92,6 @@ def test_async_camera_set_returns_latest_frame_without_waiting_for_next_read(mon
         second = cameras.snapshot(max_age_s=1.0)
 
     assert first.metadata["cam_high"]["sequence_index"] == second.metadata["cam_high"]["sequence_index"]
-
-
-def test_camera_metadata_counts_unique_frames_and_reused_rows() -> None:
-    metadata = np.asarray(
-        [
-            {"cam_high": {"sequence_index": 1, "capture_time_s": 10.0}},
-            {"cam_high": {"sequence_index": 1, "capture_time_s": 10.0}},
-            {"cam_high": {"sequence_index": 2, "capture_time_s": 10.05}},
-        ],
-        dtype=object,
-    )
-
-    timestamps, reuse = data_regression._camera_timestamps_from_npz_metadata(metadata, num_rows=3)  # noqa: SLF001
-
-    np.testing.assert_allclose(timestamps["cam_high"], np.asarray([10.0, 10.05]))
-    assert reuse["cam_high"] == {"rows": 3, "unique_frames": 2, "reused_rows": 1, "missing_rows": 0}
 
 
 def test_teleop_pair_unsynced_action_equals_follower_state() -> None:

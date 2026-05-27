@@ -6,12 +6,15 @@ import dataclasses
 import json
 from pathlib import Path
 import time
+from typing import Any
 
 from google.protobuf import timestamp_pb2
 from google.protobuf import wrappers_pb2
+from mcap.reader import make_reader
 import numpy as np
 
 from openpi.pistream import mcap as pistream_mcap
+from openpi.pistream.proto import descriptor_pb2
 from openpi.pistream.proto import frame_pb2
 
 CAMERA_FIELD_MAP = {
@@ -33,6 +36,10 @@ ACTION_START_FIELD = pistream_mcap.FieldKey("teleop", "system/active_agent/actio
 ACTION_SNAPSHOT_FIELD = pistream_mcap.FieldKey("teleop", "system/active_agent/action_snapshot")
 MIN_TIMESTAMP_STEP_NS = 1_000_000
 EXPECTED_SHARD_COUNT = 4
+CANONICAL_FORMAT = "yam_monopi_pistream_mcap_v1"
+EPISODE_METADATA_FILENAME = "episode_metadata.json"
+RECORDING_CONTEXT_FILENAME = "recording_context.json"
+IMAGE_COLOR_SPACE = "rgb24"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,6 +70,74 @@ class YamMcapEpisode:
     camera_frame_reuse: dict[str, dict[str, int]] | None = None
 
 
+def read_episode_metadata(episode_dir: Path) -> dict[str, Any]:
+    metadata_path = Path(episode_dir) / EPISODE_METADATA_FILENAME
+    if not metadata_path.is_file():
+        raise RuntimeError(
+            f"MCAP episode {episode_dir} is missing canonical sidecar {EPISODE_METADATA_FILENAME}. "
+            "Pre-cutover OpenPI/YAM MCAP episodes are unsupported."
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"MCAP episode {episode_dir} has invalid {EPISODE_METADATA_FILENAME}") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"MCAP episode {episode_dir} has non-object {EPISODE_METADATA_FILENAME}")
+    if metadata.get("format") != CANONICAL_FORMAT:
+        raise RuntimeError(
+            f"MCAP episode {episode_dir} has unsupported format {metadata.get('format')!r}; "
+            f"expected {CANONICAL_FORMAT!r}."
+        )
+    return metadata
+
+
+def write_recording_context(episode_dir: Path, context: dict[str, Any]) -> Path:
+    context_path = Path(episode_dir) / RECORDING_CONTEXT_FILENAME
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    context_path.write_text(json.dumps(context, indent=2, sort_keys=True, default=str) + "\n")
+    return context_path
+
+
+def read_recording_context(episode_dir: Path) -> dict[str, Any]:
+    context_path = Path(episode_dir) / RECORDING_CONTEXT_FILENAME
+    if not context_path.is_file():
+        return {}
+    try:
+        context = json.loads(context_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"MCAP episode {episode_dir} has invalid {RECORDING_CONTEXT_FILENAME}") from exc
+    if not isinstance(context, dict):
+        raise RuntimeError(f"MCAP episode {episode_dir} has non-object {RECORDING_CONTEXT_FILENAME}")
+    return context
+
+
+def _write_episode_metadata(
+    episode_dir: Path,
+    *,
+    task: str,
+    fps: float,
+    camera_fps: float,
+    image_width: int,
+    image_height: int,
+) -> Path:
+    metadata = {
+        "format": CANONICAL_FORMAT,
+        "task": task,
+        "fps": float(fps),
+        "row_fps": float(fps),
+        "camera_fps": float(camera_fps),
+        "image_width": int(image_width),
+        "image_height": int(image_height),
+        "image_color_space": IMAGE_COLOR_SPACE,
+        "created_at_unix_s": time.time(),
+        "mcap_layout": "monopi_pistream_sharded",
+    }
+    metadata_path = Path(episode_dir) / EPISODE_METADATA_FILENAME
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    return metadata_path
+
+
 class YamMcapEpisodeWriter:
     def __init__(
         self,
@@ -73,26 +148,23 @@ class YamMcapEpisodeWriter:
         camera_fps: float = 30.0,
         image_width: int = 640,
         image_height: int = 480,
-        camera_config: dict[str, object] | None = None,
     ) -> None:
         self._episode_dir = episode_dir
         self._fps = fps
         self._camera_fps = camera_fps
+        _write_episode_metadata(
+            episode_dir,
+            task=task,
+            fps=fps,
+            camera_fps=camera_fps,
+            image_width=image_width,
+            image_height=image_height,
+        )
         self._field_specs = _build_field_specs(width=image_width, height=image_height, fps=camera_fps)
         self._snapshot_index = _snapshot_index(_snapshot_fields())
         self._writer = pistream_mcap.ShardedMcapWriter(
             episode_dir,
             self._field_specs,
-            metadata={
-                "task": task,
-                "fps": str(fps),
-                "row_fps": str(fps),
-                "camera_fps": str(camera_fps),
-                "created_at": str(time.time()),
-                "format": "openpi_yam_pistream_mcap_v2",
-                "image_color_space": "rgb24",
-                "camera_config": json.dumps(camera_config or {}, default=str, sort_keys=True),
-            },
         )
         self._video_encoders = {
             camera_name: pistream_mcap.H264VideoEncoder[VideoUserdata](
@@ -289,7 +361,16 @@ class YamMcapEpisodeWriter:
 
 def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpisode:
     _validate_expected_shards(episode_dir)
-    metadata = pistream_mcap.read_mcap_metadata(episode_dir)
+    metadata = read_episode_metadata(episode_dir)
+    _validate_stream_descriptors(episode_dir, metadata)
+    expected_fields = {
+        spec.field_key
+        for spec in _build_field_specs(
+            width=int(metadata.get("image_width", 640)),
+            height=int(metadata.get("image_height", 480)),
+            fps=float(metadata.get("camera_fps", 30.0)),
+        )
+    }
     arrays_by_sequence: dict[pistream_mcap.FieldKey, dict[int, np.ndarray]] = {
         field: {} for field in _required_state_action_fields()
     }
@@ -308,8 +389,12 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
         if channel.topic == pistream_mcap.PI_STREAM_DESCRIPTOR_TOPIC:
             continue
         if not channel.topic.startswith(pistream_mcap.PI_STREAM_FRAME_PREFIX):
-            continue
+            raise RuntimeError(f"MCAP episode {episode_dir} contains non-canonical topic {channel.topic!r}")
         field = pistream_mcap.parse_frame_topic(channel.topic)
+        if field not in expected_fields:
+            raise RuntimeError(
+                f"MCAP episode {episode_dir} contains undeclared/non-canonical frame topic {channel.topic!r}"
+            )
         if field in arrays_by_sequence:
             decoded = frame_pb2.DoubleList()
             decoded.ParseFromString(message.data)
@@ -319,12 +404,18 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
             snapshot.ParseFromString(message.data)
             refs: dict[pistream_mcap.FieldKey, FieldValueRef] = {}
             for ref in snapshot.fields:
-                ref_field = snapshot_field_by_index.get(
-                    ref.index,
-                    pistream_mcap.FieldKey(ref.publisher_id, ref.key) if ref.publisher_id and ref.key else None,
-                )
-                if ref_field is None:
-                    continue
+                if ref.index not in snapshot_field_by_index:
+                    raise RuntimeError(
+                        f"MCAP episode {episode_dir} action_snapshot at {message.log_time} contains "
+                        f"unsupported snapshot ref index {ref.index}. Canonical YAM MCAP requires "
+                        "indexed PiStreamSnapshotRef entries."
+                    )
+                if ref.publisher_id or ref.key:
+                    raise RuntimeError(
+                        f"MCAP episode {episode_dir} action_snapshot at {message.log_time} contains "
+                        "legacy publisher_id/key snapshot refs. Canonical YAM MCAP requires index-only refs."
+                    )
+                ref_field = snapshot_field_by_index[ref.index]
                 refs[ref_field] = FieldValueRef(
                     field=ref_field,
                     sequence_id=ref.sequence_id,
@@ -411,8 +502,8 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
     action_array = np.asarray(action, dtype=np.float32)
     _validate_episode_arrays(episode_dir, state_array, action_array)
     return YamMcapEpisode(
-        task=metadata.get("task", ""),
-        fps=_fps_from_metadata_or_timestamps(metadata, timestamps_ns),
+        task=str(metadata.get("task", "")),
+        fps=_fps_from_episode_metadata_or_timestamps(metadata, timestamps_ns),
         timestamps_ns=timestamps_ns,
         state=state_array,
         action=action_array,
@@ -434,8 +525,12 @@ def read_episode(episode_dir: Path, *, decode_images: bool = True) -> YamMcapEpi
 
 
 def is_mcap_episode(episode_dir: Path) -> bool:
-    return episode_dir.is_dir() and all(
-        _expected_shard_path(episode_dir, index).is_file() for index in range(EXPECTED_SHARD_COUNT)
+    return (
+        episode_dir.is_dir()
+        and (episode_dir / EPISODE_METADATA_FILENAME).is_file()
+        and all(
+            _expected_shard_path(episode_dir, index).is_file() for index in range(EXPECTED_SHARD_COUNT)
+        )
     )
 
 
@@ -448,6 +543,65 @@ def iter_episode_dirs(raw_dir: Path) -> list[Path]:
         read_episode(path, decode_images=False)
         episode_dirs.append(path)
     return episode_dirs
+
+
+def _validate_stream_descriptors(episode_dir: Path, metadata: dict[str, Any]) -> None:
+    expected_specs = {
+        spec.field_key: spec
+        for spec in _build_field_specs(
+            width=int(metadata.get("image_width", 640)),
+            height=int(metadata.get("image_height", 480)),
+            fps=float(metadata.get("camera_fps", 30.0)),
+        )
+    }
+    expected_fields_by_shard: dict[int, set[pistream_mcap.FieldKey]] = {}
+    for spec in expected_specs.values():
+        expected_fields_by_shard.setdefault(spec.shard, set()).add(spec.field_key)
+
+    for shard_index in range(EXPECTED_SHARD_COUNT):
+        descriptor = _read_one_stream_descriptor(episode_dir, shard_index)
+        actual_fields = {
+            pistream_mcap.FieldKey(field.publisher_id, field.key) for field in descriptor.fields
+        }
+        expected_fields = expected_fields_by_shard.get(shard_index, set())
+        if actual_fields != expected_fields:
+            missing = sorted(expected_fields - actual_fields, key=lambda field: (field.publisher_id, field.key))
+            extra = sorted(actual_fields - expected_fields, key=lambda field: (field.publisher_id, field.key))
+            raise RuntimeError(
+                f"MCAP episode {episode_dir} shard {shard_index} has non-canonical stream_descriptor fields: "
+                f"missing={missing}, extra={extra}"
+            )
+        for descriptor_field in descriptor.fields:
+            field_key = pistream_mcap.FieldKey(descriptor_field.publisher_id, descriptor_field.key)
+            expected_encoding = expected_specs[field_key].encoding
+            if descriptor_field.encoding.SerializeToString() != expected_encoding.SerializeToString():
+                raise RuntimeError(
+                    f"MCAP episode {episode_dir} shard {shard_index} has non-canonical encoding for "
+                    f"{field_key.publisher_id}/{field_key.key}"
+                )
+
+
+def _read_one_stream_descriptor(episode_dir: Path, shard_index: int) -> descriptor_pb2.PiStreamDescriptor:
+    descriptors: list[descriptor_pb2.PiStreamDescriptor] = []
+    path = _expected_shard_path(episode_dir, shard_index)
+    with path.open("rb") as file:
+        reader = make_reader(file)
+        for _schema, channel, message in reader.iter_messages(log_time_order=False):
+            if channel.topic != pistream_mcap.PI_STREAM_DESCRIPTOR_TOPIC:
+                continue
+            if message.log_time != 0 or message.publish_time != 0 or message.sequence != 0:
+                raise RuntimeError(
+                    f"MCAP episode {episode_dir} shard {shard_index} has stream_descriptor outside timestamp 0"
+                )
+            descriptor = descriptor_pb2.PiStreamDescriptor()
+            descriptor.ParseFromString(message.data)
+            descriptors.append(descriptor)
+    if len(descriptors) != 1:
+        raise RuntimeError(
+            f"MCAP episode {episode_dir} shard {shard_index} must contain exactly one stream_descriptor, "
+            f"found {len(descriptors)}"
+        )
+    return descriptors[0]
 
 
 def _build_field_specs(*, width: int, height: int, fps: float) -> list[pistream_mcap.FieldSpec]:
@@ -574,7 +728,7 @@ def _camera_name_for_field(field: pistream_mcap.FieldKey) -> str:
     raise KeyError(field)
 
 
-def _fps_from_metadata_or_timestamps(metadata: dict[str, str], timestamps_ns: np.ndarray) -> float:
+def _fps_from_episode_metadata_or_timestamps(metadata: dict[str, Any], timestamps_ns: np.ndarray) -> float:
     if metadata.get("row_fps"):
         return float(metadata["row_fps"])
     if metadata.get("fps"):
@@ -590,13 +744,16 @@ def _expected_shard_path(episode_dir: Path, index: int) -> Path:
 
 
 def _validate_expected_shards(episode_dir: Path) -> None:
+    expected_names = {f"episode_part{index}.mcap" for index in range(EXPECTED_SHARD_COUNT)}
+    actual_names = {path.name for path in episode_dir.glob("episode_part*.mcap")}
     missing = [
-        _expected_shard_path(episode_dir, index).name
-        for index in range(EXPECTED_SHARD_COUNT)
-        if not _expected_shard_path(episode_dir, index).is_file()
+        shard_name for shard_name in sorted(expected_names) if not (episode_dir / shard_name).is_file()
     ]
     if missing:
         raise FileNotFoundError(f"MCAP episode {episode_dir} is missing shard(s): {missing}")
+    extra = sorted(actual_names - expected_names)
+    if extra:
+        raise RuntimeError(f"MCAP episode {episode_dir} has unexpected shard(s): {extra}")
 
 
 def _validate_snapshots(

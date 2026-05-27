@@ -9,12 +9,12 @@ import subprocess
 import time
 from typing import Any
 
-import cv2
 import numpy as np
 import tyro
 
 from examples.yam_real import common
 from examples.yam_real import data_regression
+from examples.yam_real import mcap_episode
 from openpi.shared import jpeg_transport
 from openpi.training import config as training_config
 
@@ -28,8 +28,8 @@ DEFAULT_MANIFESTS = (
 
 @dataclasses.dataclass(frozen=True)
 class Args:
-    old_good_dir: Path = Path("yam_data/archive/raw_before_moved_robot_20260525_145623")
-    moved_robot_dir: Path = Path("yam_data/archive/raw_before_recollect_20260525_172213")
+    old_good_dir: Path | None = None
+    moved_robot_dir: Path | None = None
     current_raw_dir: Path = Path("yam_data/raw")
     manifests: tuple[Path, ...] = DEFAULT_MANIFESTS
     output_dir: Path = Path("yam_data/logs/stack_audit")
@@ -47,11 +47,11 @@ class Args:
 def main(args: Args) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     workspace_root = repo_root.parent
-    groups = {
-        "old_good_20260515": args.old_good_dir,
-        "moved_robot_20260525": args.moved_robot_dir,
-        "current_recollect_20260525": args.current_raw_dir,
-    }
+    groups = {"current_recollect_20260525": args.current_raw_dir}
+    if args.old_good_dir is not None:
+        groups["old_good_20260515"] = args.old_good_dir
+    if args.moved_robot_dir is not None:
+        groups["moved_robot_20260525"] = args.moved_robot_dir
 
     issues: list[dict[str, Any]] = []
     report = {
@@ -219,7 +219,7 @@ def _resolve_manifest_entry(entry: str, groups: dict[str, Path]) -> Path | None:
     rel_path = Path(entry)
     for group_dir in groups.values():
         candidate = group_dir / rel_path
-        if (candidate / "episode.npz").exists() or any(candidate.glob("episode_part*.mcap")):
+        if mcap_episode.is_mcap_episode(candidate):
             return candidate
     return None
 
@@ -233,35 +233,42 @@ def _sample_group_images(
 ) -> list[dict]:
     samples = []
     for episode_dir in data_regression.discover_episodes(group_dir)[:max_episodes]:
-        manifest, arrays = common.load_episode(episode_dir)
-        image_paths = arrays.get("image_paths")
-        if image_paths is None or len(image_paths) == 0:
-            _add_issue(issues, "warning", group_name, f"{episode_dir.name}: no image_paths to sample")
+        episode = mcap_episode.read_episode(episode_dir, decode_images=True)
+        if episode.images is None:
+            _add_issue(issues, "warning", group_name, f"{episode_dir.name}: no decoded MCAP images to sample")
             continue
-        indexes = sorted({0, len(image_paths) // 2, len(image_paths) - 1})
+        num_rows = int(episode.state.shape[0])
+        indexes = sorted({0, num_rows // 2, num_rows - 1})
         for idx in indexes:
-            paths = image_paths[idx].item() if hasattr(image_paths[idx], "item") else image_paths[idx]
             for camera_name in common.CAMERA_NAMES:
-                image_path = episode_dir / paths[camera_name]
-                image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                image = episode.images.get(camera_name)
                 if image is None:
-                    _add_issue(issues, "blocker", group_name, f"failed to read {image_path}")
+                    _add_issue(issues, "blocker", group_name, f"{episode_dir.name}: missing {camera_name} images")
                     continue
+                frame = np.asarray(image[idx])
                 stats = {
                     "episode": episode_dir.name,
                     "frame_index": idx,
                     "camera": camera_name,
-                    "path": str(image_path),
-                    "shape": list(image.shape),
-                    "mean_bgr": np.mean(image, axis=(0, 1)).astype(float).tolist(),
-                    "std": float(np.std(image)),
+                    "shape": list(frame.shape),
+                    "mean_rgb": np.mean(frame, axis=(0, 1)).astype(float).tolist(),
+                    "std": float(np.std(frame)),
                 }
-                if image.ndim != 3 or image.shape[2] != 3:
-                    _add_issue(issues, "blocker", group_name, f"{image_path} has bad image shape {image.shape}")
+                if frame.ndim != 3 or frame.shape[2] != 3:
+                    _add_issue(
+                        issues,
+                        "blocker",
+                        group_name,
+                        f"{episode_dir.name} {camera_name} frame {idx} has bad image shape {frame.shape}",
+                    )
                 if stats["std"] < 1.0:
-                    _add_issue(issues, "warning", group_name, f"{image_path} appears nearly blank")
+                    _add_issue(
+                        issues,
+                        "warning",
+                        group_name,
+                        f"{episode_dir.name} {camera_name} frame {idx} appears nearly blank",
+                    )
                 samples.append(stats)
-        _ = manifest
     return samples
 
 

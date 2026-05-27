@@ -119,7 +119,6 @@ def compressed_video_encoding(*, width: int, height: int, fps: float) -> encodin
                     encoding_pb2.CompressedVideoEncoding.EncoderOption(name="crf", value="19"),
                     encoding_pb2.CompressedVideoEncoding.EncoderOption(name="gop_size", value="4"),
                     encoding_pb2.CompressedVideoEncoding.EncoderOption(name="bf", value="0"),
-                    encoding_pb2.CompressedVideoEncoding.EncoderOption(name="tune", value="zerolatency"),
                 ],
             ),
         )
@@ -149,8 +148,6 @@ class ShardedMcapWriter:
         self,
         output_dir: Path,
         field_specs: Iterable[FieldSpec],
-        *,
-        metadata: dict[str, str] | None = None,
     ) -> None:
         self._output_dir = output_dir
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -165,11 +162,6 @@ class ShardedMcapWriter:
             output_path = self._output_dir / f"episode_part{shard}.mcap"
             file = output_path.open("wb")
             writer = mcap_protobuf.writer.Writer(file, chunk_size=MCAP_CHUNK_SIZE)
-            if metadata:
-                writer._writer.add_metadata(  # noqa: SLF001
-                    "yam_episode",
-                    {key: str(value) for key, value in metadata.items()},
-                )
             self._files[shard] = file
             self._writers[shard] = writer
 
@@ -410,16 +402,6 @@ def iter_mcap_messages(episode_dir: Path):
         with path.open("rb") as file:
             reader = make_reader(file)
             yield from reader.iter_messages(log_time_order=False)
-
-
-def read_mcap_metadata(episode_dir: Path, *, name: str = "yam_episode") -> dict[str, str]:
-    for path in sorted(episode_dir.glob("episode_part*.mcap")):
-        with path.open("rb") as file:
-            reader = make_reader(file)
-            for metadata in reader.iter_metadata():
-                if metadata.name == name:
-                    return dict(metadata.metadata)
-    return {}
 
 
 class _ClearableBytesIO(io.BytesIO):

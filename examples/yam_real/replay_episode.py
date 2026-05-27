@@ -10,6 +10,7 @@ import numpy as np
 import tyro
 
 from examples.yam_real import common
+from examples.yam_real import mcap_episode
 
 
 @dataclasses.dataclass
@@ -26,15 +27,15 @@ class Args:
 
 
 def main(args: Args) -> None:
-    manifest, arrays = common.load_episode(args.episode_dir)
-    actions = np.asarray(arrays["action"], dtype=np.float32)
+    episode = mcap_episode.read_episode(args.episode_dir, decode_images=False)
+    actions = np.asarray(episode.action, dtype=np.float32)
     if args.max_steps is not None:
         actions = actions[: args.max_steps]
-    fps = args.fps or float(manifest["fps"])
+    fps = args.fps or float(episode.fps)
 
     print(f"Episode: {args.episode_dir}")
     print(f"Frames: {len(actions)}, fps={fps}, execute={args.execute}")
-    print(f"Task: {manifest.get('task', '')}")
+    print(f"Task: {episode.task}")
     if not args.execute:
         print("Dry run only. Re-run with --execute to command the followers.")
         print(f"First action: {actions[0].round(4).tolist()}")

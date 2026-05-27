@@ -498,7 +498,6 @@ class WriterProcessClient:
         camera_fps: float,
         image_width: int,
         image_height: int,
-        camera_config: dict[str, Any],
         timeout_s: float,
     ) -> None:
         self.poll()
@@ -511,7 +510,6 @@ class WriterProcessClient:
                 "camera_fps": camera_fps,
                 "image_width": image_width,
                 "image_height": image_height,
-                "camera_config": camera_config,
             },
             timeout_s=timeout_s,
         )
@@ -700,7 +698,6 @@ class YamMultiprocessRuntime:
         camera_fps: float,
         image_width: int,
         image_height: int,
-        camera_config: dict[str, Any],
     ) -> None:
         if self.writer is None:
             raise WorkerRuntimeError("Writer process is not started")
@@ -711,7 +708,6 @@ class YamMultiprocessRuntime:
             camera_fps=camera_fps,
             image_width=image_width,
             image_height=image_height,
-            camera_config=camera_config,
             timeout_s=self._writer_drain_timeout_s,
         )
 
@@ -923,7 +919,6 @@ def _writer_worker_main(
                     camera_fps=float(command["camera_fps"]),
                     image_width=int(command["image_width"]),
                     image_height=int(command["image_height"]),
-                    camera_config=dict(command["camera_config"]),
                 )
                 written_rows = 0
                 status_queue.put({"type": "episode_started", "episode_dir": str(episode_dir)})

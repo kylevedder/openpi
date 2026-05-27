@@ -4,13 +4,14 @@ import dataclasses
 from pathlib import Path
 import time
 
-import cv2
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import msgpack_numpy
 import tyro
 
 from examples.yam_real import common
+from examples.yam_real import data_regression
+from examples.yam_real import mcap_episode
 from openpi.shared import jpeg_transport
 
 
@@ -98,11 +99,13 @@ def _measure_quality(
 
 def _load_observations(raw_dir: Path, episode_manifest: Path | None, max_observations: int):
     for episode_dir in _episode_dirs(raw_dir, episode_manifest):
-        _, arrays = common.load_episode(episode_dir)
-        for image_paths in arrays["image_paths"]:
-            paths = image_paths.item() if hasattr(image_paths, "item") else image_paths
+        episode = mcap_episode.read_episode(episode_dir, decode_images=True)
+        if episode.images is None:
+            continue
+        rows = int(episode.state.shape[0])
+        for idx in range(rows):
             yield {
-                camera_name: _load_resized_rgb(episode_dir / paths[camera_name]) for camera_name in common.CAMERA_NAMES
+                camera_name: _resize_rgb(episode.images[camera_name][idx]) for camera_name in common.CAMERA_NAMES
             }
             max_observations -= 1
             if max_observations <= 0:
@@ -111,7 +114,7 @@ def _load_observations(raw_dir: Path, episode_manifest: Path | None, max_observa
 
 def _episode_dirs(raw_dir: Path, episode_manifest: Path | None) -> list[Path]:
     if episode_manifest is None:
-        return sorted(path for path in raw_dir.iterdir() if (path / "manifest.json").exists())
+        return data_regression.discover_episodes(raw_dir, source_format="mcap")
 
     if not episode_manifest.exists():
         raise FileNotFoundError(episode_manifest)
@@ -125,17 +128,13 @@ def _episode_dirs(raw_dir: Path, episode_manifest: Path | None) -> list[Path]:
         if rel_path.is_absolute() or ".." in rel_path.parts:
             raise ValueError(f"Invalid episode path on line {line_number}: {entry}")
         episode_dir = raw_dir / rel_path
-        if not (episode_dir / "manifest.json").exists():
-            raise FileNotFoundError(f"Manifest-listed episode is missing manifest.json: {episode_dir}")
+        if not mcap_episode.is_mcap_episode(episode_dir):
+            raise FileNotFoundError(f"Manifest-listed episode is not a canonical MCAP YAM episode: {episode_dir}")
         episode_dirs.append(episode_dir)
     return episode_dirs
 
 
-def _load_resized_rgb(path: Path) -> np.ndarray:
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise FileNotFoundError(path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+def _resize_rgb(image: np.ndarray) -> np.ndarray:
     return image_tools.convert_to_uint8(image_tools.resize_with_pad(image, *jpeg_transport.IMAGE_RESOLUTION))
 
 

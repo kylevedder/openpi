@@ -17,6 +17,7 @@ import numpy as np
 import tyro
 
 from examples.yam_real import common
+from examples.yam_real import mcap_episode
 from examples.yam_real import process_runtime
 from examples.yam_real import read_yam_encoders
 
@@ -379,8 +380,6 @@ def _probe_image_save(args: Args, output_dir: Path) -> list[Sample]:
 
 
 def _probe_mcap_write(args: Args, output_dir: Path) -> list[Sample]:
-    from examples.yam_real import mcap_episode
-
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -394,8 +393,8 @@ def _probe_mcap_write(args: Args, output_dir: Path) -> list[Sample]:
         camera_fps=args.camera_fps,
         image_width=args.camera_width,
         image_height=args.camera_height,
-        camera_config={"probe": "mcap-write", "requested": _camera_config(args).as_manifest()},
     )
+    _write_probe_context(output_dir, args, probe="mcap-write")
     samples: list[Sample] = []
     deadline = time.perf_counter() + args.duration_s
     sample_index = 0
@@ -733,12 +732,14 @@ def _probe_process_writer(args: Args, output_dir: Path) -> list[Sample]:
             camera_fps=args.camera_fps,
             image_width=args.camera_width,
             image_height=args.camera_height,
-            camera_config={
-                "probe": "process-writer",
-                "requested": _camera_config(args).as_manifest(),
-                "backend": "multiprocessing_shared_memory",
-            },
             timeout_s=args.writer_drain_timeout_s,
+        )
+        _write_probe_context(
+            output_dir,
+            args,
+            probe="process-writer",
+            backend="multiprocessing_shared_memory",
+            worker_pid=writer.pid,
         )
         next_write_t = time.perf_counter()
         deadline = time.perf_counter() + args.duration_s
@@ -851,13 +852,15 @@ def _probe_process_record_loop_dry(args: Args, scratch_dir: Path) -> list[Sample
                 camera_fps=args.camera_fps,
                 image_width=args.camera_width,
                 image_height=args.camera_height,
-                camera_config={
-                    "probe": "process-record-loop-dry",
-                    "requested": _camera_config(args).as_manifest(),
-                    "actual_modes": runtime.camera_actual_modes,
-                    "camera_paths": common.CAMERA_PATHS,
-                    "backend": "multiprocessing",
-                },
+            )
+            _write_probe_context(
+                scratch_dir,
+                args,
+                probe="process-record-loop-dry",
+                backend="multiprocessing",
+                actual_modes=runtime.camera_actual_modes,
+                process_ids=runtime.process_ids,
+                camera_paths=common.CAMERA_PATHS,
             )
             episode_started = True
             record_period_s = 1.0 / args.fps
@@ -986,8 +989,6 @@ def _run_record_loop_variant(
     include_cameras: bool,
     include_mcap_write: bool,
 ) -> list[Sample]:
-    from examples.yam_real import mcap_episode
-
     samples: list[Sample] = []
     writer = None
     if include_mcap_write:
@@ -1000,8 +1001,8 @@ def _run_record_loop_variant(
             camera_fps=args.camera_fps,
             image_width=args.camera_width,
             image_height=args.camera_height,
-            camera_config={"probe": "record-loop-dry", "variant": variant_name},
         )
+        _write_probe_context(output_dir, args, probe="record-loop-dry", variant=variant_name)
     next_record_t = time.perf_counter()
     deadline = time.perf_counter() + args.duration_s
     frame_index = 0
@@ -1156,6 +1157,17 @@ def _camera_config(args: Args) -> common.CameraConfig:
         pixel_format=args.camera_pixel_format,
         verify_mode=not args.skip_camera_mode_verify,
     )
+
+
+def _write_probe_context(output_dir: Path, args: Args, **extra: Any) -> None:
+    context = {
+        "args": dataclasses.asdict(args),
+        "camera_requested": _camera_config(args).as_manifest(),
+        "created_at_unix_s": time.time(),
+        "hardware_backend": extra.pop("backend", "single_process_probe"),
+        **extra,
+    }
+    mcap_episode.write_recording_context(output_dir, context)
 
 
 def _open_camera(name: str, path: str, *, config: common.CameraConfig) -> common.LinuxpyV4L2Camera:
