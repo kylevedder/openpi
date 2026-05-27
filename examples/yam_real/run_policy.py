@@ -49,7 +49,7 @@ class Args:
     log_dir: Path = Path("yam_data/logs/run_policy")
     image_transport: Literal["auto", "raw", "jpeg_q85_224_rgb_v1"] = "auto"
     prefetch_action_chunks: bool = True
-    prefetch_remaining_steps: int | None = None
+    prefetch_remaining_steps: int = 0
     camera_fps: float = 30.0
     camera_width: int = 640
     camera_height: int = 480
@@ -117,7 +117,8 @@ def _run_policy(args: Args) -> None:
         f"policy_fps={playback_timing.policy_fps:g}; action_playback_fps={playback_timing.playback_fps:g}; "
         f"playback_slowdown={playback_timing.playback_slowdown:.2f}x; "
         f"inter_chunk_delay_s={playback_timing.inter_chunk_delay_s:g}; action_horizon={args.action_horizon}; "
-        f"prefetch_remaining_steps={playback_timing.prefetch_remaining_steps}"
+        f"prefetch_remaining_steps={playback_timing.prefetch_remaining_steps}; "
+        f"prefetch_lead_s={playback_timing.prefetch_lead_s:.3f}"
     )
     if not args.execute:
         _log("Dry run only. Observations will be sent to the server, but followers will not be commanded.")
@@ -265,10 +266,11 @@ def _run_policy(args: Args) -> None:
                         _command_followers(command, follower_l, follower_r)
 
                     remaining_steps = len(chunk_actions) - chunk_step
-                    if (
-                        args.prefetch_action_chunks
-                        and pending_chunk is None
-                        and remaining_steps == playback_timing.prefetch_remaining_steps
+                    if _should_prefetch_action_chunk(
+                        prefetch_action_chunks=args.prefetch_action_chunks,
+                        pending_chunk=pending_chunk,
+                        remaining_steps=remaining_steps,
+                        playback_timing=playback_timing,
                     ):
                         captured = _capture_policy_observation(
                             follower_l,
@@ -278,8 +280,10 @@ def _run_policy(args: Args) -> None:
                         )
                         _log(
                             f"step={step}: prefetching next action chunk "
-                            f"(remaining_steps={remaining_steps}, capture_ms={captured.capture_ms:.1f}, "
-                            f"state_ms={captured.state_ms:.1f}, camera_ms={captured.camera_ms:.1f})"
+                            f"(remaining_steps={remaining_steps}, capture_step={step}, "
+                            f"prefetch_lead_s={playback_timing.prefetch_lead_s:.3f}, "
+                            f"capture_ms={captured.capture_ms:.1f}, state_ms={captured.state_ms:.1f}, "
+                            f"camera_ms={captured.camera_ms:.1f})"
                         )
                         pending_chunk = chunk_executor.submit(
                             _infer_action_chunk,
@@ -357,15 +361,13 @@ def _resolve_playback_timing(args: Args) -> _PlaybackTiming:
     if inter_chunk_delay_s < 0:
         raise ValueError(f"--inter-chunk-delay-s must be non-negative, got {args.inter_chunk_delay_s!r}")
 
-    default_prefetch_remaining_steps_at_policy_fps = 30
-    if args.prefetch_remaining_steps is None:
-        prefetch_lead_s = default_prefetch_remaining_steps_at_policy_fps / policy_fps
-        prefetch_remaining_steps = round(prefetch_lead_s * playback_fps)
-    else:
-        prefetch_remaining_steps = int(args.prefetch_remaining_steps)
-        prefetch_lead_s = prefetch_remaining_steps / playback_fps
-
-    prefetch_remaining_steps = max(0, min(prefetch_remaining_steps, args.action_horizon - 1))
+    prefetch_remaining_steps = int(args.prefetch_remaining_steps)
+    if prefetch_remaining_steps < 0 or prefetch_remaining_steps >= args.action_horizon:
+        raise ValueError(
+            "--prefetch-remaining-steps must be in the range "
+            f"[0, action_horizon - 1], got {prefetch_remaining_steps} for action_horizon={args.action_horizon}"
+        )
+    prefetch_lead_s = prefetch_remaining_steps / playback_fps
     return _PlaybackTiming(
         policy_fps=policy_fps,
         playback_fps=playback_fps,
@@ -374,6 +376,21 @@ def _resolve_playback_timing(args: Args) -> _PlaybackTiming:
         inter_chunk_delay_s=inter_chunk_delay_s,
         prefetch_remaining_steps=prefetch_remaining_steps,
         prefetch_lead_s=prefetch_lead_s,
+    )
+
+
+def _should_prefetch_action_chunk(
+    *,
+    prefetch_action_chunks: bool,
+    pending_chunk: object | None,
+    remaining_steps: int,
+    playback_timing: _PlaybackTiming,
+) -> bool:
+    return (
+        prefetch_action_chunks
+        and pending_chunk is None
+        and playback_timing.prefetch_remaining_steps > 0
+        and remaining_steps == playback_timing.prefetch_remaining_steps
     )
 
 

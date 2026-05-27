@@ -212,8 +212,9 @@ uv run python -m examples.yam_real.run_policy \
 
 By default `run_policy` uses `--image-transport auto`, which follows the policy metadata. The JPEG-trained policy
 advertises `jpeg_q85_224_rgb_v1`, so the local robot host sends compressed `224x224` images automatically.
-`run_policy` also prefetches the next action chunk by default when the current 50-step chunk has 30 steps remaining.
-Disable with `--no-prefetch-action-chunks` when debugging strictly synchronous inference timing.
+Early action-chunk prefetch is off by default: `--prefetch-remaining-steps 0` means the next observation and inference
+start only after the current chunk and any inter-chunk hold finish. Set `--prefetch-remaining-steps N` to start
+inference when `N` actions remain in the current chunk; `--no-prefetch-action-chunks` remains a hard off switch.
 
 For slow-motion debugging, keep `--fps 50` so the policy metadata still matches the trained model, and set
 `--action-playback-fps` to the slower command rate. `--max-steps` is still an action-row count, not seconds, so
