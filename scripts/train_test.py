@@ -22,6 +22,7 @@ def test_train(tmp_path: pathlib.Path, config_name: str):
         resume=False,
         num_train_steps=2,
         log_interval=1,
+        tracking_backend="none",
     )
     train.main(config)
 

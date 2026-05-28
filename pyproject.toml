@@ -27,6 +27,8 @@ dependencies = [
     "pillow>=11.0.0",
     "sentencepiece>=0.2.0",
     "torch==2.7.1",
+    # Trackio 0.21+ requires huggingface-hub>=1.10, which conflicts with transformers==4.53.2.
+    "trackio>=0.20.2,<0.21.0",
     "tqdm-loggable>=0.2",
     "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
@@ -136,7 +138,7 @@ unfixable = [
 force-single-line = true
 force-sort-within-sections = true
 single-line-exclusions = ["collections.abc", "typing", "typing_extensions"]
-known-third-party = ["wandb"]
+known-third-party = ["trackio", "wandb"]
 
 [build-system]
 requires = ["hatchling"]

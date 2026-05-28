@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -14,7 +15,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
-import wandb
 
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
@@ -22,6 +22,7 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.experiment_logger as _experiment_logger
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
@@ -45,29 +46,6 @@ def init_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
-
-
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
-
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
-
-    if log_code:
-        wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -212,68 +190,86 @@ def main(config: _config.TrainConfig):
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
+        max_to_keep=config.max_to_keep,
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    logger = _experiment_logger.init_logger(config, resuming=resuming, enabled=jax.process_index() == 0)
 
-    data_loader = _data_loader.create_data_loader(
-        config,
-        sharding=data_sharding,
-        shuffle=True,
-    )
-    data_iter = iter(data_loader)
-    batch = next(data_iter)
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
-
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
-
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
-
-    if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
-
-    start_step = int(train_state.step)
-    pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
-        initial=start_step,
-        total=config.num_train_steps,
-        dynamic_ncols=True,
-    )
-
-    infos = []
-    for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
+    try:
+        data_loader = _data_loader.create_data_loader(
+            config,
+            sharding=data_sharding,
+            shuffle=True,
+        )
+        data_iter = iter(data_loader)
         batch = next(data_iter)
+        logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        # Log images from first batch to sanity check.
+        if logger.enabled:
+            images_to_log = [
+                logger.image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+                for i in range(min(5, len(next(iter(batch[0].images.values())))))
+            ]
+            logger.log({"data/camera_views": images_to_log}, step=0)
 
-    logging.info("Waiting for checkpoint manager to finish")
-    checkpoint_manager.wait_until_finished()
+        train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+        jax.block_until_ready(train_state)
+        logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+
+        if resuming:
+            train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
+
+        start_step = int(train_state.step)
+        pbar = tqdm.tqdm(
+            range(start_step, config.num_train_steps),
+            initial=start_step,
+            total=config.num_train_steps,
+            dynamic_ncols=True,
+        )
+
+        lr_schedule = config.lr_schedule.create()
+        infos = []
+        log_start_time = time.time()
+        for step in pbar:
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(train_rng, train_state, batch)
+            infos.append(info)
+            if step % config.log_interval == 0:
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                elapsed = time.time() - log_start_time
+                logger.log(
+                    {
+                        "train/loss": float(reduced_info["loss"]),
+                        "train/grad_norm": float(reduced_info["grad_norm"]),
+                        "train/param_norm": float(reduced_info["param_norm"]),
+                        "train/learning_rate": float(jax.device_get(lr_schedule(step))),
+                        "perf/time_per_step": elapsed / max(1, len(infos)),
+                    },
+                    step=step,
+                )
+                log_start_time = time.time()
+                infos = []
+            batch = next(data_iter)
+
+            if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+                logger.log({"checkpoint/step": step}, step=step)
+    finally:
+        logging.info("Waiting for checkpoint manager to finish")
+        checkpoint_manager.wait_until_finished()
+        logger.finish()
 
 
 if __name__ == "__main__":

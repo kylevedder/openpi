@@ -34,6 +34,7 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+TrackingBackend: TypeAlias = Literal["trackio", "wandb", "none"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -596,7 +597,9 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
-    # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
+    # Maximum number of recent checkpoints to keep. If None, keep all checkpoints.
+    max_to_keep: int | None = None
+    # For bounded retention, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
     # If true, will overwrite the checkpoint directory if it already exists.
@@ -604,7 +607,12 @@ class TrainConfig:
     # If true, will resume training from the last checkpoint.
     resume: bool = False
 
-    # If true, will enable wandb logging.
+    # Experiment tracking backend. Trackio logs locally by default; use "none" to disable all experiment tracking.
+    tracking_backend: TrackingBackend = "trackio"
+    # Optional Trackio storage directory. If unset, TRACKIO_DIR is respected or checkpoint_base_dir/trackio is used.
+    tracking_dir: str | None = None
+
+    # Legacy WandB switch. Only used when tracking_backend is "wandb".
     wandb_enabled: bool = True
 
     # Used to pass metadata to the policy server.
@@ -955,8 +963,9 @@ _CONFIGS = [
             image_transport=jpeg_transport.IMAGE_TRANSPORT,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=20_000,
+        num_train_steps=3_000,
         batch_size=32,
+        ema_decay=None,
         policy_metadata={
             "reset_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             "action_space": yam_policy.ACTION_SPACE,

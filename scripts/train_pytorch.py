@@ -38,13 +38,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
-import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.experiment_logger as _experiment_logger
 
 
 def init_logging():
@@ -67,28 +67,6 @@ def init_logging():
         logger.addHandler(ch)
     else:
         logger.handlers[0].setFormatter(formatter)
-
-
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
-    """Initialize wandb logging."""
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
-
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
 
 def setup_ddp():
@@ -146,7 +124,7 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, logger):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -189,9 +167,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
-        # Log checkpoint to wandb
-        if config.wandb_enabled:
-            wandb.log({"checkpoint_step": global_step}, step=global_step)
+        logger.log({"checkpoint/step": global_step}, step=global_step)
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -310,8 +286,9 @@ def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
+    logger = _experiment_logger.disabled()
 
-    # Initialize checkpoint directory and wandb
+    # Initialize checkpoint directory and experiment tracking.
     resuming = False
     if config.resume:
         # Find checkpoint directory based on experiment name
@@ -342,9 +319,9 @@ def train_loop(config: _config.TrainConfig):
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
-    # Initialize wandb (only on main process)
+    # Initialize experiment tracking (only on main process)
     if is_main:
-        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        logger = _experiment_logger.init_logger(config, resuming=resuming)
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -358,8 +335,8 @@ def train_loop(config: _config.TrainConfig):
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
 
-    # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
+    # Log sample images on first batch.
+    if is_main and logger.enabled and not resuming:
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
@@ -368,7 +345,7 @@ def train_loop(config: _config.TrainConfig):
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
-        # Create sample images for wandb
+        # Create sample images for experiment tracking.
         images_to_log = []
         # Get batch size from the first image tensor
         batch_size = next(iter(sample_batch["image"].values())).shape[0]
@@ -377,9 +354,9 @@ def train_loop(config: _config.TrainConfig):
             # Convert from NCHW to NHWC format for wandb
             img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
             img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
+            images_to_log.append(logger.image(img_concatenated))
 
-        wandb.log({"camera_views": images_to_log}, step=0)
+        logger.log({"data/camera_views": images_to_log}, step=0)
 
         # Clear sample batch from memory aggressively
         del sample_batch, observation, actions, images_to_log, img_concatenated
@@ -506,120 +483,123 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
-    while global_step < config.num_train_steps:
-        # Set epoch for distributed training
-        if use_ddp and hasattr(loader, "set_epoch"):
-            loader.set_epoch(global_step // len(loader))
+    try:
+        while global_step < config.num_train_steps:
+            # Set epoch for distributed training
+            if use_ddp and hasattr(loader, "set_epoch"):
+                loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
-            # Check if we've reached the target number of steps
-            if global_step >= config.num_train_steps:
-                break
+            for observation, actions in loader:
+                # Check if we've reached the target number of steps
+                if global_step >= config.num_train_steps:
+                    break
 
-            # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+                # The unified data loader returns (observation, actions) tuple
+                observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+                actions = actions.to(torch.float32)  # noqa: PLW2901
+                actions = actions.to(device)  # noqa: PLW2901
 
-            # Update LR
-            for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+                # Update LR
+                for pg in optim.param_groups:
+                    pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                # Forward pass
+                losses = model(observation, actions)
+                # Ensure losses is a tensor and handle different return types
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+                loss = losses.mean()
 
-            # Backward pass
-            loss.backward()
+                # Backward pass
+                loss.backward()
 
-            # Log memory usage after backward pass
-            if global_step < 5 and is_main and torch.cuda.is_available():
-                log_memory_usage(device, global_step, "after_backward")
+                # Log memory usage after backward pass
+                if global_step < 5 and is_main and torch.cuda.is_available():
+                    log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
-
-            # Optimizer step
-            optim.step()
-            optim.zero_grad(set_to_none=True)
-
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
-
-            # Collect stats
-            if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
+                # Gradient clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=config.optimizer.clip_gradient_norm
                 )
 
-            if is_main and (global_step % config.log_interval == 0):
-                elapsed = time.time() - start_time
+                # Optimizer step
+                optim.step()
+                optim.zero_grad(set_to_none=True)
 
-                # Average stats over log interval
-                avg_loss = sum(info["loss"] for info in infos) / len(infos)
-                avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                # Clear gradients more aggressively
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad.detach_()
+                        param.grad = None
 
-                avg_grad_norm = None
-                if any("grad_norm" in info for info in infos):
-                    vals = [
-                        info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None
-                    ]
-                    if len(vals) > 0:
-                        avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+                # Collect stats
+                if is_main:
+                    infos.append(
+                        {
+                            "loss": loss.item(),
+                            "learning_rate": optim.param_groups[0]["lr"],
+                            "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        }
+                    )
 
-                # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
-                    log_payload = {
-                        "loss": avg_loss,
-                        "learning_rate": avg_lr,
-                        "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
-                    }
-                    if avg_grad_norm is not None:
-                        log_payload["grad_norm"] = avg_grad_norm
-                    wandb.log(log_payload, step=global_step)
+                if is_main and (global_step % config.log_interval == 0):
+                    elapsed = time.time() - start_time
 
-                start_time = time.time()
-                infos = []  # Reset stats collection
+                    # Average stats over log interval
+                    avg_loss = sum(info["loss"] for info in infos) / len(infos)
+                    avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 
-            global_step += 1
-            # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+                    avg_grad_norm = None
+                    if any("grad_norm" in info for info in infos):
+                        vals = [
+                            info["grad_norm"]
+                            for info in infos
+                            if "grad_norm" in info and info["grad_norm"] is not None
+                        ]
+                        if len(vals) > 0:
+                            avg_grad_norm = sum(vals) / len(vals)
+                    logging.info(
+                        f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                        if avg_grad_norm is not None
+                        else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    )
 
-            # Update progress bar
-            if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
-                )
+                    if len(infos) > 0:
+                        log_payload = {
+                            "train/loss": avg_loss,
+                            "train/learning_rate": avg_lr,
+                            "perf/time_per_step": elapsed / max(1, len(infos)),
+                        }
+                        if avg_grad_norm is not None:
+                            log_payload["train/grad_norm"] = avg_grad_norm
+                        logger.log(log_payload, step=global_step)
 
-    # Close progress bar
-    if pbar is not None:
-        pbar.close()
+                    start_time = time.time()
+                    infos = []  # Reset stats collection
 
-    # Finish wandb run
-    if is_main and config.wandb_enabled:
-        wandb.finish()
+                global_step += 1
+                # Save checkpoint using the new mechanism
+                save_checkpoint(model, optim, global_step, config, is_main, data_config, logger)
 
-    cleanup_ddp()
+                # Update progress bar
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{loss.item():.4f}",
+                            "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                            "step": global_step,
+                        }
+                    )
+    finally:
+        if pbar is not None:
+            pbar.close()
+        if is_main:
+            logger.finish()
+        cleanup_ddp()
 
 
 def main():
