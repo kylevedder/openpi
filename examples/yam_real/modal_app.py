@@ -11,12 +11,16 @@ APP_NAME = "yam-openpi"
 OPENPI_ROOT = "/root/openpi"
 VOLUME_ROOT = "/mnt/yam"
 CONFIG_NAME = "pi05_yam_bimanual_50hz_jpeg_q85"
-DEFAULT_EXP_NAME = "yam_bimanual_50hz_jpeg_q85_24demo_20260526_v1"
-SERVE_CHECKPOINT_STEP = 999
+DEFAULT_EXP_NAME = "yam_bimanual_50hz_jpeg_q85_latest"
+SERVE_CHECKPOINT_STEP = 2999
 QUIC_REGIONS = ["us-west-1", "westus"]
 QUIC_SCALEDOWN_WINDOW_S = 20 * 60
+NORM_STATS_CPUS = 16.0
+NORM_STATS_NUM_WORKERS = 16
 DEFAULT_MODAL_RAW_DIR = f"{VOLUME_ROOT}/raw/yam_data/raw"
-DEFAULT_MODAL_EPISODE_MANIFEST = f"{VOLUME_ROOT}/raw/yam_data/manifests/pi05_yam_bimanual_50hz_24demo.txt"
+DEFAULT_MODAL_EPISODE_MANIFEST = (
+    f"{VOLUME_ROOT}/raw/yam_data/manifests/pi05_yam_bimanual_50hz_latest.txt"
+)
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name("yam-openpi", create_if_missing=True)
@@ -78,12 +82,32 @@ image = (
 )
 
 
-@app.function(image=image, volumes={VOLUME_ROOT: volume}, timeout=60 * 60)
-def compute_norm_stats(config_name: str = CONFIG_NAME, max_frames: int | None = None) -> None:
+@app.function(
+    image=image,
+    volumes={VOLUME_ROOT: volume},
+    cpu=NORM_STATS_CPUS,
+    memory=65536,
+    ephemeral_disk=524288,
+    timeout=60 * 60,
+)
+def compute_norm_stats(
+    config_name: str = CONFIG_NAME,
+    max_frames: int | None = None,
+    batch_size: int | None = None,
+    num_workers: int = NORM_STATS_NUM_WORKERS,
+    log_system_stats: bool = True,
+    system_stats_interval_s: float = 10.0,
+) -> None:
     _prepare_volume_paths()
     cmd = ["uv", "run", "scripts/compute_norm_stats.py", "--config-name", config_name]
     if max_frames is not None:
         cmd.extend(["--max-frames", str(max_frames)])
+    if batch_size is not None:
+        cmd.extend(["--batch-size", str(batch_size)])
+    cmd.extend(["--num-workers", str(num_workers)])
+    if log_system_stats:
+        cmd.append("--log-system-stats")
+        cmd.extend(["--system-stats-interval-s", str(system_stats_interval_s)])
     subprocess.run(cmd, cwd=OPENPI_ROOT, check=True)
     volume.commit()
 
@@ -129,6 +153,7 @@ def train(
     exp_name: str = DEFAULT_EXP_NAME,
     num_train_steps: int | None = None,
     batch_size: int | None = None,
+    tracking_backend: str = "trackio",
     overwrite: bool = False,  # noqa: FBT001, FBT002
     wandb_enabled: bool = False,  # noqa: FBT001, FBT002
 ) -> None:
@@ -138,6 +163,7 @@ def train(
         exp_name=exp_name,
         num_train_steps=num_train_steps,
         batch_size=batch_size,
+        tracking_backend=tracking_backend,
         overwrite=overwrite,
         wandb_enabled=wandb_enabled,
     )
@@ -151,6 +177,7 @@ def train_fsdp2(
     exp_name: str = DEFAULT_EXP_NAME,
     num_train_steps: int | None = None,
     batch_size: int | None = None,
+    tracking_backend: str = "trackio",
     overwrite: bool = False,  # noqa: FBT001, FBT002
     wandb_enabled: bool = False,  # noqa: FBT001, FBT002
 ) -> None:
@@ -160,6 +187,7 @@ def train_fsdp2(
         exp_name=exp_name,
         num_train_steps=num_train_steps,
         batch_size=batch_size,
+        tracking_backend=tracking_backend,
         overwrite=overwrite,
         wandb_enabled=wandb_enabled,
         fsdp_devices=2,
@@ -255,11 +283,13 @@ def _train_cmd(
     exp_name: str,
     num_train_steps: int | None,
     batch_size: int | None,
+    tracking_backend: str,
     overwrite: bool,
     wandb_enabled: bool,
     fsdp_devices: int | None = None,
 ) -> list[str]:
     cmd = ["uv", "run", "scripts/train.py", config_name, f"--exp-name={exp_name}"]
+    cmd.extend(["--tracking-backend", tracking_backend])
     if overwrite:
         cmd.append("--overwrite")
     if not wandb_enabled:

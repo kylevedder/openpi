@@ -5,7 +5,10 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import contextlib
+import os
 import numpy as np
+import threading
 import tqdm
 import tyro
 
@@ -19,6 +22,61 @@ import openpi.transforms as transforms
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+
+
+def _start_system_stats_logger(enabled: bool, interval_s: float) -> contextlib.AbstractContextManager[None]:
+    if not enabled:
+        return contextlib.nullcontext()
+
+    try:
+        import psutil
+    except ImportError:
+        print("[norm-stats-system] psutil is not installed; system stats logging is disabled.", flush=True)
+        return contextlib.nullcontext()
+
+    stop_event = threading.Event()
+
+    @contextlib.contextmanager
+    def monitor():
+        process = psutil.Process()
+        print(
+            f"[norm-stats-system] logical_cpus={os.cpu_count()} "
+            f"interval_s={interval_s:.1f} main_pid={process.pid}",
+            flush=True,
+        )
+        psutil.cpu_percent(interval=None)
+        process.cpu_percent(interval=None)
+
+        def log_loop() -> None:
+            while not stop_event.wait(interval_s):
+                children = process.children(recursive=True)
+                child_cpu = 0.0
+                for child in children:
+                    with contextlib.suppress(psutil.Error):
+                        child_cpu += child.cpu_percent(interval=None)
+                process_cpu = 0.0
+                with contextlib.suppress(psutil.Error):
+                    process_cpu = process.cpu_percent(interval=None)
+                loadavg = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
+                print(
+                    "[norm-stats-system] "
+                    f"cpu_total={psutil.cpu_percent(interval=None):.1f}% "
+                    f"main_cpu={process_cpu:.1f}% "
+                    f"child_cpu={child_cpu:.1f}% "
+                    f"child_processes={len(children)} "
+                    f"loadavg={loadavg[0]:.2f},{loadavg[1]:.2f},{loadavg[2]:.2f}",
+                    flush=True,
+                )
+
+        thread = threading.Thread(target=log_loop, name="norm-stats-system-monitor", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            thread.join(timeout=interval_s)
+
+    return monitor()
 
 
 def create_torch_dataloader(
@@ -86,25 +144,41 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+    log_system_stats: bool = False,
+    system_stats_interval_s: float = 10.0,
+):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
+    batch_size = batch_size or config.batch_size
+    num_workers = config.num_workers if num_workers is None else num_workers
+    print(
+        "Norm stats settings: "
+        f"config_name={config_name} batch_size={batch_size} num_workers={num_workers} "
+        f"max_frames={max_frames} logical_cpus={os.cpu_count()}",
+        flush=True,
+    )
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, max_frames
+            data_config, config.model.action_horizon, batch_size, max_frames
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config, config.model.action_horizon, batch_size, config.model, num_workers, max_frames
         )
 
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
-        for key in keys:
-            stats[key].update(np.asarray(batch[key]))
+    with _start_system_stats_logger(log_system_stats, system_stats_interval_s):
+        for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+            for key in keys:
+                stats[key].update(np.asarray(batch[key]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 

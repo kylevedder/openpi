@@ -36,7 +36,7 @@ class Args:
     fps: float = 50.0
     action_playback_fps: float | None = None
     inter_chunk_delay_s: float = 0.0
-    max_steps: int = 200
+    max_steps: int = 15_000
     action_horizon: int = 50
     gripper: Literal["crank_4310", "linear_3507", "linear_4310"] = "linear_4310"
     max_arm_step_rad: float = 0.02
@@ -45,7 +45,7 @@ class Args:
     connect_timeout_s: float | None = 20.0
     connection_retry_interval_s: float = 5.0
     response_status_interval_s: float | None = 5.0
-    per_step_log_interval: int = 1
+    per_step_log_interval: int = 25
     log_dir: Path = Path("yam_data/logs/run_policy")
     image_transport: Literal["auto", "raw", "jpeg_q85_224_rgb_v1"] = "auto"
     prefetch_action_chunks: bool = True
@@ -88,7 +88,6 @@ class _PlaybackTiming:
     playback_slowdown: float
     inter_chunk_delay_s: float
     prefetch_remaining_steps: int
-    prefetch_lead_s: float
 
 
 def main(args: Args) -> None:
@@ -117,8 +116,7 @@ def _run_policy(args: Args) -> None:
         f"policy_fps={playback_timing.policy_fps:g}; action_playback_fps={playback_timing.playback_fps:g}; "
         f"playback_slowdown={playback_timing.playback_slowdown:.2f}x; "
         f"inter_chunk_delay_s={playback_timing.inter_chunk_delay_s:g}; action_horizon={args.action_horizon}; "
-        f"prefetch_remaining_steps={playback_timing.prefetch_remaining_steps}; "
-        f"prefetch_lead_s={playback_timing.prefetch_lead_s:.3f}"
+        f"prefetch_remaining_steps={playback_timing.prefetch_remaining_steps}"
     )
     if not args.execute:
         _log("Dry run only. Observations will be sent to the server, but followers will not be commanded.")
@@ -167,8 +165,7 @@ def _run_policy(args: Args) -> None:
             _log(
                 "Starting policy loop "
                 f"(prefetch_action_chunks={args.prefetch_action_chunks}, "
-                f"prefetch_remaining_steps={playback_timing.prefetch_remaining_steps}, "
-                f"prefetch_lead_s={playback_timing.prefetch_lead_s:.3f})"
+                f"prefetch_remaining_steps={playback_timing.prefetch_remaining_steps})"
             )
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as chunk_executor:
                 for step in range(args.max_steps):
@@ -281,7 +278,6 @@ def _run_policy(args: Args) -> None:
                         _log(
                             f"step={step}: prefetching next action chunk "
                             f"(remaining_steps={remaining_steps}, capture_step={step}, "
-                            f"prefetch_lead_s={playback_timing.prefetch_lead_s:.3f}, "
                             f"capture_ms={captured.capture_ms:.1f}, state_ms={captured.state_ms:.1f}, "
                             f"camera_ms={captured.camera_ms:.1f})"
                         )
@@ -367,7 +363,6 @@ def _resolve_playback_timing(args: Args) -> _PlaybackTiming:
             "--prefetch-remaining-steps must be in the range "
             f"[0, action_horizon - 1], got {prefetch_remaining_steps} for action_horizon={args.action_horizon}"
         )
-    prefetch_lead_s = prefetch_remaining_steps / playback_fps
     return _PlaybackTiming(
         policy_fps=policy_fps,
         playback_fps=playback_fps,
@@ -375,7 +370,6 @@ def _resolve_playback_timing(args: Args) -> _PlaybackTiming:
         playback_slowdown=policy_fps / playback_fps,
         inter_chunk_delay_s=inter_chunk_delay_s,
         prefetch_remaining_steps=prefetch_remaining_steps,
-        prefetch_lead_s=prefetch_lead_s,
     )
 
 

@@ -12,10 +12,9 @@ def test_resolve_playback_timing_defaults_prefetch_to_zero() -> None:
     timing = run_policy._resolve_playback_timing(run_policy.Args())  # noqa: SLF001
 
     assert timing.prefetch_remaining_steps == 0
-    assert timing.prefetch_lead_s == 0.0
 
 
-def test_resolve_playback_timing_preserves_explicit_prefetch_lookback() -> None:
+def test_resolve_playback_timing_preserves_explicit_prefetch_remaining_steps() -> None:
     timing = run_policy._resolve_playback_timing(  # noqa: SLF001
         run_policy.Args(
             fps=50.0,
@@ -26,11 +25,10 @@ def test_resolve_playback_timing_preserves_explicit_prefetch_lookback() -> None:
     )
 
     assert timing.prefetch_remaining_steps == 30
-    assert timing.prefetch_lead_s == pytest.approx(30.0 / 25.0)
 
 
 @pytest.mark.parametrize("prefetch_remaining_steps", [-1, 50])
-def test_resolve_playback_timing_rejects_out_of_range_prefetch_lookback(
+def test_resolve_playback_timing_rejects_out_of_range_prefetch_remaining_steps(
     prefetch_remaining_steps: int,
 ) -> None:
     with pytest.raises(ValueError, match="--prefetch-remaining-steps"):
@@ -39,7 +37,7 @@ def test_resolve_playback_timing_rejects_out_of_range_prefetch_lookback(
         )
 
 
-def test_prefetch_lookback_zero_does_not_schedule_early_prefetch() -> None:
+def test_prefetch_remaining_steps_zero_does_not_schedule_early_prefetch() -> None:
     timing = run_policy._resolve_playback_timing(  # noqa: SLF001
         run_policy.Args(action_horizon=50, inter_chunk_delay_s=2.0, prefetch_remaining_steps=0)
     )
@@ -52,7 +50,7 @@ def test_prefetch_lookback_zero_does_not_schedule_early_prefetch() -> None:
     )
 
 
-def test_prefetch_lookback_fires_when_requested_remaining_steps_are_reached() -> None:
+def test_prefetch_fires_when_requested_remaining_steps_are_reached() -> None:
     timing = run_policy._resolve_playback_timing(  # noqa: SLF001
         run_policy.Args(action_horizon=50, prefetch_remaining_steps=30)
     )

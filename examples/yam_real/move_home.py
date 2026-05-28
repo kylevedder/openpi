@@ -19,9 +19,9 @@ class Args:
     hz: float = 50.0
     hold_s: float = 1.0
     hold_forever: bool = False
-    gripper_target: Literal["current", "open", "closed"] = "current"
+    gripper_target: Literal["current", "open", "closed"] = "open"
     use_gravity_comp: bool = True
-    execute: bool = False
+    execute: bool = True
 
 
 def main(args: Args) -> None:

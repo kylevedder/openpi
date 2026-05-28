@@ -45,13 +45,13 @@ Disable gravity compensation for recording with `--no-use-gravity-comp` if you n
 Move both followers home and open the grippers:
 
 ```bash
-uv run python -m examples.yam_real.move_home \
-  --execute \
-  --side both \
-  --duration-s 5 \
-  --hold-s 1 \
-  --gripper-target open \
-  --use-gravity-comp
+uv run python -m examples.yam_real.move_home
+```
+
+For a dry run:
+
+```bash
+uv run python -m examples.yam_real.move_home --no-execute
 ```
 
 ## 1. Record One Teleop Episode
@@ -111,17 +111,15 @@ Replay applies per-step delta limits before commanding the followers.
 Create an explicit training manifest so conversion uses only the selected demos:
 
 ```bash
+export YAM_MANIFEST=yam_data/manifests/pi05_yam_bimanual_50hz_latest.txt
+
 uv run python -m examples.yam_real.build_episode_manifest \
-  --raw-dir yam_data/raw \
-  --output yam_data/manifests/pi05_yam_bimanual_50hz_20demo.txt \
-  --min-frames 1
+  --output "$YAM_MANIFEST"
 ```
 
 ```bash
 uv run python -m examples.yam_real.convert_yam_data_to_lerobot \
-  --raw-dir yam_data/raw \
-  --episode-manifest yam_data/manifests/pi05_yam_bimanual_50hz_20demo.txt \
-  --repo-id local/yam_bimanual
+  --episode-manifest "$YAM_MANIFEST"
 ```
 
 The converter accepts canonical MonoPI PiStream MCAP episodes and writes LeRobot image-frame output. It writes
@@ -139,9 +137,7 @@ Benchmark the transport on the local recordings:
 
 ```bash
 uv run python -m examples.yam_real.benchmark_jpeg_transport \
-  --raw-dir yam_data/raw \
-  --episode-manifest yam_data/manifests/pi05_yam_bimanual_50hz_20demo.txt \
-  --max-observations 80
+  --episode-manifest "$YAM_MANIFEST"
 ```
 
 On the initial 80-observation sample, raw msgpack was about `452 KB` per request. JPEG Q85 was about `28 KB`, roughly
@@ -154,40 +150,47 @@ during serving.
 Install and authenticate Modal locally, then run:
 
 ```bash
+export YAM_MANIFEST=yam_data/manifests/pi05_yam_bimanual_50hz_latest.txt
+
+uv run python -m examples.yam_real.build_episode_manifest \
+  --output "$YAM_MANIFEST"
+
 uvx --from modal modal volume create yam-openpi
 uvx --from modal modal volume put yam-openpi /home/pi-sj/code/openpi/yam_data/raw /raw/yam_data/raw -f
 uvx --from modal modal volume put yam-openpi /home/pi-sj/code/openpi/yam_data/manifests /raw/yam_data/manifests -f
-uvx --from modal modal run examples/yam_real/modal_app.py::preprocess_yam_mcap_to_lerobot \
-  --raw-dir /mnt/yam/raw/yam_data/raw \
-  --episode-manifest /mnt/yam/raw/yam_data/manifests/pi05_yam_bimanual_50hz_24demo.txt \
-  --repo-id local/yam_bimanual \
-  --mode image \
-  --episode-processes 8 \
-  --scratch-dir /tmp/yam_lerobot_preprocess \
-  --profile-jsonl /tmp/yam_lerobot_preprocess/profile.jsonl \
-  --overwrite
-uvx --from modal modal run examples/yam_real/modal_app.py::compute_norm_stats \
-  --config-name pi05_yam_bimanual_50hz_jpeg_q85
-uvx --from modal modal run examples/yam_real/modal_app.py::train_fsdp2 \
-  --config-name pi05_yam_bimanual_50hz_jpeg_q85 \
-  --exp-name yam_bimanual_50hz_jpeg_q85_24demo_20260526_v1 \
-  --num-train-steps 1000 \
-  --batch-size 8 \
-  --overwrite
 ```
 
-Use the short run first to validate the pipeline. For a real run over the full 20k-step config, omit
-`--num-train-steps 100`:
+Preprocess the latest manifest into the default `local/yam_bimanual` LeRobot dataset. The Modal entrypoint defaults to
+`/mnt/yam/raw/yam_data/raw`, `pi05_yam_bimanual_50hz_latest.txt`, image mode, overwrite enabled, and repo id
+`local/yam_bimanual`; only the process count is overridden here.
 
 ```bash
-uvx --from modal modal run --detach examples/yam_real/modal_app.py::train_fsdp2 \
-  --config-name pi05_yam_bimanual_50hz_jpeg_q85 \
-  --exp-name yam_bimanual_50hz_jpeg_q85_24demo_20260526_v1 \
-  --batch-size 8
+uvx --from modal modal run examples/yam_real/modal_app.py::preprocess_yam_mcap_to_lerobot \
+  --episode-processes 16
 ```
 
-The Modal serving entrypoint is configured to serve checkpoint step `999` from
-`yam_bimanual_50hz_jpeg_q85_24demo_20260526_v1`.
+Then run norm stats and training. The config `pi05_yam_bimanual_50hz_jpeg_q85` trains for 3,000 steps, uses batch size
+32, disables EMA, and saves checkpoints every 1,000 steps; the final checkpoint is step `2999`.
+
+```bash
+uvx --from modal modal run examples/yam_real/modal_app.py::compute_norm_stats
+
+uvx --from modal modal run --detach examples/yam_real/modal_app.py::train_fsdp2 \
+  --overwrite
+```
+
+The Modal serving entrypoint is configured to serve checkpoint step `2999` from
+`yam_bimanual_50hz_jpeg_q85_latest`.
+
+Training logs local Trackio curves under `checkpoints/trackio` by default. From a machine with the checkpoint volume
+available, launch the dashboard with:
+
+```bash
+TRACKIO_DIR=checkpoints/trackio uv run trackio show --project openpi
+```
+
+Pass `--tracking-backend none` to the Modal training function to disable experiment tracking, or
+`--tracking-backend wandb --wandb-enabled` to opt into WandB.
 
 ```bash
 uvx --from modal modal deploy examples/yam_real/modal_app.py
@@ -209,27 +212,13 @@ yam_data/logs/run_policy/latest.log
 Use dry-run first. The robot host sends observations and prints policy actions but does not command the followers:
 
 ```bash
-uv run python -m examples.yam_real.run_policy \
-  --host wss://<modal-endpoint-host> \
-  --prompt "pick up the object and place it in the target area" \
-  --max-steps 40 \
-  --fps 50 \
-  --action-horizon 50 \
-  --use-gravity-comp
+uv run python -m examples.yam_real.run_policy --transport modal-quic
 ```
 
-For the Modal QUIC path, use the deployed class directly instead of a `wss://` host:
+When dry-run looks sane, command the followers:
 
 ```bash
-uv run python -m examples.yam_real.run_policy \
-  --transport modal-quic \
-  --modal-app-name yam-openpi \
-  --modal-class-name YamQuicPolicyServer \
-  --prompt "pick up the object and place it in the target area" \
-  --max-steps 40 \
-  --fps 50 \
-  --action-horizon 50 \
-  --use-gravity-comp
+uv run python -m examples.yam_real.run_policy --transport modal-quic --execute
 ```
 
 By default `run_policy` uses `--image-transport auto`, which follows the policy metadata. The JPEG-trained policy
@@ -243,39 +232,6 @@ For slow-motion debugging, keep `--fps 50` so the policy metadata still matches 
 `--action-playback-fps 10 --max-steps 1200` runs for about 2 minutes.
 Add `--inter-chunk-delay-s` to insert a hold pause after each completed action chunk; this delay does not count
 against `--max-steps`.
-
-```bash
-uv run python -m examples.yam_real.run_policy \
-  --transport modal-quic \
-  --modal-app-name yam-openpi \
-  --modal-class-name YamQuicPolicyServer \
-  --modal-server-start-timeout-s 1200 \
-  --prompt "pick up the object and place it in the target area" \
-  --max-steps 1200 \
-  --fps 50 \
-  --action-horizon 50 \
-  --action-playback-fps 10 \
-  --inter-chunk-delay-s 1.0 \
-  --max-arm-step-rad 0.01 \
-  --max-gripper-step 0.01 \
-  --use-gravity-comp \
-  --execute
-```
-
-Run a short bounded execute with an empty workspace only after dry-run returns sane 14D actions:
-
-```bash
-uv run python -m examples.yam_real.run_policy \
-  --host wss://<modal-endpoint-host> \
-  --prompt "pick up the object and place it in the target area" \
-  --max-steps 50 \
-  --fps 50 \
-  --action-horizon 50 \
-  --max-arm-step-rad 0.01 \
-  --max-gripper-step 0.01 \
-  --use-gravity-comp \
-  --execute
-```
 
 ## 6. Latency Diagnostics
 
@@ -398,17 +354,5 @@ source by passing the episode path in `--inputs` and selecting `--source-format 
 Then run the task with the normal per-step limits:
 
 ```bash
-uv run python -m examples.yam_real.run_policy \
-  --transport modal-quic \
-  --modal-app-name yam-openpi \
-  --modal-class-name YamQuicPolicyServer \
-  --modal-server-start-timeout-s 1200 \
-  --prompt "pick up the object and place it in the target area" \
-  --max-steps 200 \
-  --fps 50 \
-  --action-horizon 50 \
-  --max-arm-step-rad 0.02 \
-  --max-gripper-step 0.02 \
-  --use-gravity-comp \
-  --execute
+uv run python -m examples.yam_real.run_policy --transport modal-quic --execute
 ```
