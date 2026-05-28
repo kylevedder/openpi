@@ -17,6 +17,18 @@ QUIC_REGIONS = ["us-west-1", "westus"]
 QUIC_SCALEDOWN_WINDOW_S = 20 * 60
 NORM_STATS_CPUS = 16.0
 NORM_STATS_NUM_WORKERS = 16
+H100_TRAIN_GPUS = "H100:8"
+H100_TRAIN_CPUS = 64.0
+H100_TRAIN_NUM_WORKERS = 32
+H100_TRAIN_FSDP_DEVICES = 8
+A100_TRAIN_GPUS = "A100-80GB:8"
+A100_TRAIN_CPUS = H100_TRAIN_CPUS
+A100_TRAIN_NUM_WORKERS = H100_TRAIN_NUM_WORKERS
+A100_TRAIN_FSDP_DEVICES = H100_TRAIN_FSDP_DEVICES
+A100_FALLBACK_GPUS = "A100-80GB:4"
+A100_FALLBACK_CPUS = 32.0
+A100_FALLBACK_NUM_WORKERS = 16
+A100_FALLBACK_FSDP_DEVICES = 4
 DEFAULT_MODAL_RAW_DIR = f"{VOLUME_ROOT}/raw/yam_data/raw"
 DEFAULT_MODAL_EPISODE_MANIFEST = (
     f"{VOLUME_ROOT}/raw/yam_data/manifests/pi05_yam_bimanual_50hz_latest.txt"
@@ -95,7 +107,7 @@ def compute_norm_stats(
     max_frames: int | None = None,
     batch_size: int | None = None,
     num_workers: int = NORM_STATS_NUM_WORKERS,
-    log_system_stats: bool = True,
+    log_system_stats: bool = True,  # noqa: FBT001, FBT002
     system_stats_interval_s: float = 10.0,
 ) -> None:
     _prepare_volume_paths()
@@ -196,6 +208,93 @@ def train_fsdp2(
     volume.commit()
 
 
+@app.function(image=image, gpu=H100_TRAIN_GPUS, cpu=H100_TRAIN_CPUS, volumes={VOLUME_ROOT: volume}, timeout=24 * 60 * 60)
+def train_fsdp8_h100(
+    config_name: str = CONFIG_NAME,
+    exp_name: str = DEFAULT_EXP_NAME,
+    num_train_steps: int | None = None,
+    batch_size: int | None = None,
+    num_workers: int | None = H100_TRAIN_NUM_WORKERS,
+    tracking_backend: str = "trackio",
+    overwrite: bool = False,  # noqa: FBT001, FBT002
+    wandb_enabled: bool = False,  # noqa: FBT001, FBT002
+) -> None:
+    _prepare_volume_paths()
+    cmd = _train_cmd(
+        config_name=config_name,
+        exp_name=exp_name,
+        num_train_steps=num_train_steps,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        tracking_backend=tracking_backend,
+        overwrite=overwrite,
+        wandb_enabled=wandb_enabled,
+        fsdp_devices=H100_TRAIN_FSDP_DEVICES,
+    )
+    subprocess.run(cmd, cwd=OPENPI_ROOT, check=True)
+    volume.commit()
+
+
+@app.function(image=image, gpu=A100_TRAIN_GPUS, cpu=A100_TRAIN_CPUS, volumes={VOLUME_ROOT: volume}, timeout=24 * 60 * 60)
+def train_fsdp8_a100(
+    config_name: str = CONFIG_NAME,
+    exp_name: str = DEFAULT_EXP_NAME,
+    num_train_steps: int | None = None,
+    batch_size: int | None = None,
+    num_workers: int | None = A100_TRAIN_NUM_WORKERS,
+    tracking_backend: str = "trackio",
+    overwrite: bool = False,  # noqa: FBT001, FBT002
+    wandb_enabled: bool = False,  # noqa: FBT001, FBT002
+) -> None:
+    _prepare_volume_paths()
+    cmd = _train_cmd(
+        config_name=config_name,
+        exp_name=exp_name,
+        num_train_steps=num_train_steps,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        tracking_backend=tracking_backend,
+        overwrite=overwrite,
+        wandb_enabled=wandb_enabled,
+        fsdp_devices=A100_TRAIN_FSDP_DEVICES,
+    )
+    subprocess.run(cmd, cwd=OPENPI_ROOT, check=True)
+    volume.commit()
+
+
+@app.function(
+    image=image,
+    gpu=A100_FALLBACK_GPUS,
+    cpu=A100_FALLBACK_CPUS,
+    volumes={VOLUME_ROOT: volume},
+    timeout=24 * 60 * 60,
+)
+def train_fsdp4_a100(
+    config_name: str = CONFIG_NAME,
+    exp_name: str = DEFAULT_EXP_NAME,
+    num_train_steps: int | None = None,
+    batch_size: int | None = None,
+    num_workers: int | None = A100_FALLBACK_NUM_WORKERS,
+    tracking_backend: str = "trackio",
+    overwrite: bool = False,  # noqa: FBT001, FBT002
+    wandb_enabled: bool = False,  # noqa: FBT001, FBT002
+) -> None:
+    _prepare_volume_paths()
+    cmd = _train_cmd(
+        config_name=config_name,
+        exp_name=exp_name,
+        num_train_steps=num_train_steps,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        tracking_backend=tracking_backend,
+        overwrite=overwrite,
+        wandb_enabled=wandb_enabled,
+        fsdp_devices=A100_FALLBACK_FSDP_DEVICES,
+    )
+    subprocess.run(cmd, cwd=OPENPI_ROOT, check=True)
+    volume.commit()
+
+
 @app.function(
     image=image,
     gpu="A100-40GB",
@@ -287,6 +386,7 @@ def _train_cmd(
     overwrite: bool,
     wandb_enabled: bool,
     fsdp_devices: int | None = None,
+    num_workers: int | None = None,
 ) -> list[str]:
     cmd = ["uv", "run", "scripts/train.py", config_name, f"--exp-name={exp_name}"]
     cmd.extend(["--tracking-backend", tracking_backend])
@@ -300,6 +400,8 @@ def _train_cmd(
         cmd.extend(["--batch-size", str(batch_size)])
     if fsdp_devices is not None:
         cmd.extend(["--fsdp-devices", str(fsdp_devices)])
+    if num_workers is not None:
+        cmd.extend(["--num-workers", str(num_workers)])
     return cmd
 
 

@@ -170,12 +170,27 @@ uvx --from modal modal run examples/yam_real/modal_app.py::preprocess_yam_mcap_t
 ```
 
 Then run norm stats and training. The config `pi05_yam_bimanual_50hz_jpeg_q85` trains for 3,000 steps, uses batch size
-32, disables EMA, and saves checkpoints every 1,000 steps; the final checkpoint is step `2999`.
+32, disables EMA, and saves checkpoints every 1,000 steps; the final checkpoint is step `2999`. The H100x8 Modal
+entrypoint reserves 64 CPUs and uses 32 dataloader workers by default.
 
 ```bash
 uvx --from modal modal run examples/yam_real/modal_app.py::compute_norm_stats
 
-uvx --from modal modal run --detach examples/yam_real/modal_app.py::train_fsdp2 \
+uvx --from modal modal run --detach examples/yam_real/modal_app.py::train_fsdp8_h100 \
+  --overwrite
+```
+
+If H100x8 capacity is unavailable, use the A100x8 fallback with the same CPU, worker, and FSDP shape:
+
+```bash
+uvx --from modal modal run --detach examples/yam_real/modal_app.py::train_fsdp8_a100 \
+  --overwrite
+```
+
+If A100x8 capacity is also unavailable, use the smaller A100x4 fallback:
+
+```bash
+uvx --from modal modal run --detach examples/yam_real/modal_app.py::train_fsdp4_a100 \
   --overwrite
 ```
 
